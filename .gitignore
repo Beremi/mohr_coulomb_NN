@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+runs/
+data/
+*.h5
+*.pt
+*.png
+*.json

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mc-surrogate"
+version = "0.1.0"
+description = "Python Mohr-Coulomb constitutive surrogate workflow for slope-stability studies."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name = "OpenAI"}]
+license = {text = "MIT"}
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "h5py>=3.8",
+  "torch>=2.0",
+  "matplotlib>=3.7",
+  "PyYAML>=6.0"
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
