@@ -33,6 +33,7 @@ class DatasetGenerationConfig:
     seed: int = 0
     candidate_batch: int = 4096
     include_tangent: bool = False
+    max_abs_principal_strain: float | None = None
     split_fractions: tuple[float, float, float] = (0.8, 0.1, 0.1)
     branch_fractions: dict[str, float] = field(
         default_factory=lambda: {
@@ -226,18 +227,26 @@ def _concat_dicts(chunks: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
     return out
 
 
-def generate_branch_balanced_dataset(
-    output_path: str,
-    cfg: DatasetGenerationConfig,
-) -> dict[str, int]:
-    """
-    Generate an HDF5 dataset using branch-targeted rejection sampling.
+def _dataset_attrs_from_config(cfg: DatasetGenerationConfig) -> dict[str, object]:
+    return {
+        "generator": "branch_targeted_rejection_sampling",
+        "seed": cfg.seed,
+        "config": {
+            "n_samples": cfg.n_samples,
+            "candidate_batch": cfg.candidate_batch,
+            "include_tangent": cfg.include_tangent,
+            "max_abs_principal_strain": cfg.max_abs_principal_strain,
+            "split_fractions": cfg.split_fractions,
+            "branch_fractions": cfg.branch_fractions,
+            "material_ranges": cfg.material_ranges.__dict__,
+        },
+    }
 
-    Returns
-    -------
-    dict
-        Final branch counts in the saved dataset.
-    """
+
+def generate_branch_balanced_arrays(
+    cfg: DatasetGenerationConfig,
+) -> tuple[dict[str, np.ndarray], dict[str, int]]:
+    """Generate branch-balanced constitutive samples and return arrays in memory."""
     rng = np.random.default_rng(cfg.seed)
     fractions = cfg.branch_fractions
     if not np.isclose(sum(fractions.values()), 1.0):
@@ -299,6 +308,8 @@ def generate_branch_balanced_dataset(
             response._input_strain = strain_eng  # small convenience for packing
 
             matched = response.branch_id == BRANCH_TO_ID[branch]
+            if cfg.max_abs_principal_strain is not None:
+                matched = matched & (np.max(np.abs(principal_strain), axis=1) <= cfg.max_abs_principal_strain)
             idx = np.flatnonzero(matched)
             if idx.size == 0:
                 continue
@@ -335,19 +346,24 @@ def generate_branch_balanced_dataset(
     arrays = _concat_dicts(saved_chunks)
     perm = rng.permutation(arrays["strain_eng"].shape[0])
     arrays = {key: value[perm] for key, value in arrays.items()}
+    counts = {name: int(np.sum(arrays["branch_id"] == BRANCH_TO_ID[name])) for name in BRANCH_NAMES}
+    return arrays, counts
 
-    attrs = {
-        "generator": "branch_targeted_rejection_sampling",
-        "seed": cfg.seed,
-        "config": {
-            "n_samples": cfg.n_samples,
-            "candidate_batch": cfg.candidate_batch,
-            "include_tangent": cfg.include_tangent,
-            "split_fractions": cfg.split_fractions,
-            "branch_fractions": cfg.branch_fractions,
-            "material_ranges": cfg.material_ranges.__dict__,
-        },
-    }
+
+def generate_branch_balanced_dataset(
+    output_path: str,
+    cfg: DatasetGenerationConfig,
+) -> dict[str, int]:
+    """
+    Generate an HDF5 dataset using branch-targeted rejection sampling.
+
+    Returns
+    -------
+    dict
+        Final branch counts in the saved dataset.
+    """
+    arrays, counts = generate_branch_balanced_arrays(cfg)
+    attrs = _dataset_attrs_from_config(cfg)
     save_dataset_hdf5(
         output_path,
         arrays,
@@ -355,5 +371,4 @@ def generate_branch_balanced_dataset(
         seed=cfg.seed,
         attrs=attrs,
     )
-    counts = {name: int(np.sum(arrays["branch_id"] == BRANCH_TO_ID[name])) for name in BRANCH_NAMES}
     return counts

@@ -52,6 +52,13 @@ class TrainingConfig:
     branch_loss_weight: float = 0.1
     num_workers: int = 0
     device: str = "auto"
+    scheduler_kind: str = "plateau"
+    warmup_epochs: int = 0
+    min_lr: float = 1.0e-6
+    lbfgs_epochs: int = 0
+    lbfgs_lr: float = 0.25
+    lbfgs_max_iter: int = 20
+    lbfgs_history_size: int = 100
 
 
 def set_seed(seed: int) -> None:
@@ -208,6 +215,87 @@ def _epoch_loop(
     }
 
 
+def _build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    config: TrainingConfig,
+) -> tuple[torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None, str]:
+    """Build an epoch scheduler and describe how it should be stepped."""
+    if config.scheduler_kind == "none":
+        return None, "none"
+
+    if config.scheduler_kind == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=0.5,
+            patience=max(3, config.patience // 4),
+            min_lr=config.min_lr,
+        )
+        return scheduler, "val"
+
+    if config.scheduler_kind == "cosine":
+        if config.epochs <= 0:
+            return None, "none"
+        if config.warmup_epochs > 0:
+            start_factor = max(config.min_lr / max(config.lr, 1.0e-12), 1.0e-3)
+            warmup = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=min(start_factor, 1.0),
+                end_factor=1.0,
+                total_iters=config.warmup_epochs,
+            )
+            remain = max(1, config.epochs - config.warmup_epochs)
+            cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=remain,
+                eta_min=config.min_lr,
+            )
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup, cosine],
+                milestones=[config.warmup_epochs],
+            )
+        else:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=max(1, config.epochs),
+                eta_min=config.min_lr,
+            )
+        return scheduler, "epoch"
+
+    raise ValueError(f"Unsupported scheduler kind {config.scheduler_kind!r}.")
+
+
+def _write_history_row(
+    history_path: Path,
+    *,
+    epoch: int,
+    lr: float,
+    train_metrics: dict[str, float],
+    val_metrics: dict[str, float],
+    lbfgs_phase: int,
+) -> None:
+    with history_path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                epoch,
+                lr,
+                train_metrics["loss"],
+                val_metrics["loss"],
+                train_metrics["regression_mse"],
+                val_metrics["regression_mse"],
+                train_metrics["stress_mse"],
+                val_metrics["stress_mse"],
+                train_metrics["branch_loss"],
+                val_metrics["branch_loss"],
+                train_metrics["branch_accuracy"],
+                val_metrics["branch_accuracy"],
+                lbfgs_phase,
+            ]
+        )
+
+
 def train_model(config: TrainingConfig) -> dict[str, Any]:
     """Train a constitutive surrogate and save history/checkpoints."""
     set_seed(config.seed)
@@ -236,12 +324,7 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=0.5,
-        patience=max(3, config.patience // 4),
-    )
+    scheduler, scheduler_step_mode = _build_scheduler(optimizer, config)
 
     history_path = run_dir / "history.csv"
     with history_path.open("w", newline="", encoding="utf-8") as f:
@@ -260,10 +343,13 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
                 "val_branch_loss",
                 "train_branch_accuracy",
                 "val_branch_accuracy",
+                "lbfgs_phase",
             ]
         )
 
     best_val = float("inf")
+    best_epoch = 0
+    completed_epochs = 0
     epochs_without_improvement = 0
 
     metadata = {
@@ -299,27 +385,22 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
             grad_clip=config.grad_clip,
         )
 
-        scheduler.step(val_metrics["loss"])
+        if scheduler is not None:
+            if scheduler_step_mode == "val":
+                scheduler.step(val_metrics["loss"])
+            elif scheduler_step_mode == "epoch":
+                scheduler.step()
         current_lr = optimizer.param_groups[0]["lr"]
 
-        with history_path.open("a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                [
-                    epoch,
-                    current_lr,
-                    train_metrics["loss"],
-                    val_metrics["loss"],
-                    train_metrics["regression_mse"],
-                    val_metrics["regression_mse"],
-                    train_metrics["stress_mse"],
-                    val_metrics["stress_mse"],
-                    train_metrics["branch_loss"],
-                    val_metrics["branch_loss"],
-                    train_metrics["branch_accuracy"],
-                    val_metrics["branch_accuracy"],
-                ]
-            )
+        _write_history_row(
+            history_path,
+            epoch=epoch,
+            lr=current_lr,
+            train_metrics=train_metrics,
+            val_metrics=val_metrics,
+            lbfgs_phase=0,
+        )
+        completed_epochs = epoch
 
         checkpoint = {
             "model_state_dict": model.state_dict(),
@@ -329,6 +410,7 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
 
         if val_metrics["loss"] < best_val:
             best_val = val_metrics["loss"]
+            best_epoch = epoch
             epochs_without_improvement = 0
             torch.save(checkpoint, best_checkpoint_path)
         else:
@@ -337,8 +419,90 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
         if epochs_without_improvement >= config.patience:
             break
 
+    if config.lbfgs_epochs > 0:
+        best_ckpt = torch.load(best_checkpoint_path, map_location=device)
+        model.load_state_dict(best_ckpt["model_state_dict"])
+        model.to(device)
+        train_full = tuple(t.to(device) for t in train_ds.tensors)
+        lbfgs = torch.optim.LBFGS(
+            model.parameters(),
+            lr=config.lbfgs_lr,
+            max_iter=config.lbfgs_max_iter,
+            history_size=config.lbfgs_history_size,
+            line_search_fn="strong_wolfe",
+        )
+
+        for lbfgs_epoch in range(1, config.lbfgs_epochs + 1):
+            xb, yb, branch, stress_true, eigvecs = train_full
+
+            def closure() -> torch.Tensor:
+                lbfgs.zero_grad(set_to_none=True)
+                out = model(xb)
+                reg_loss, _ = _regression_loss(
+                    model_kind=config.model_kind,
+                    pred_norm=out["stress"],
+                    target_norm=yb,
+                    y_scaler=y_scaler,
+                    eigvecs=eigvecs,
+                    stress_true=stress_true,
+                )
+                loss = reg_loss
+                if "branch_logits" in out:
+                    branch_loss = nn.functional.cross_entropy(out["branch_logits"], branch)
+                    loss = loss + config.branch_loss_weight * branch_loss
+                loss.backward()
+                return loss
+
+            model.train(True)
+            lbfgs.step(closure)
+
+            train_metrics = _epoch_loop(
+                model=model,
+                loader=train_loader,
+                optimizer=None,
+                model_kind=config.model_kind,
+                y_scaler=y_scaler,
+                branch_loss_weight=config.branch_loss_weight,
+                device=device,
+                grad_clip=config.grad_clip,
+            )
+            val_metrics = _epoch_loop(
+                model=model,
+                loader=val_loader,
+                optimizer=None,
+                model_kind=config.model_kind,
+                y_scaler=y_scaler,
+                branch_loss_weight=config.branch_loss_weight,
+                device=device,
+                grad_clip=config.grad_clip,
+            )
+            epoch = completed_epochs + lbfgs_epoch
+            current_lr = lbfgs.param_groups[0]["lr"]
+            _write_history_row(
+                history_path,
+                epoch=epoch,
+                lr=current_lr,
+                train_metrics=train_metrics,
+                val_metrics=val_metrics,
+                lbfgs_phase=1,
+            )
+
+            checkpoint = {
+                "model_state_dict": model.state_dict(),
+                "metadata": metadata,
+            }
+            torch.save(checkpoint, last_checkpoint_path)
+
+            if val_metrics["loss"] < best_val:
+                best_val = val_metrics["loss"]
+                best_epoch = epoch
+                torch.save(checkpoint, best_checkpoint_path)
+            completed_epochs = epoch
+
     summary = {
         "best_val_loss": best_val,
+        "best_epoch": best_epoch,
+        "completed_epochs": completed_epochs,
         "run_dir": str(run_dir),
         "best_checkpoint": str(best_checkpoint_path),
         "history_csv": str(history_path),
