@@ -13,7 +13,19 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--run-dir", required=True)
-    parser.add_argument("--model-kind", choices=("principal", "raw"), default="principal")
+    parser.add_argument(
+        "--model-kind",
+        choices=(
+            "principal",
+            "raw",
+            "raw_branch",
+            "trial_raw",
+            "trial_raw_branch",
+            "trial_raw_residual",
+            "trial_raw_branch_residual",
+        ),
+        default="principal",
+    )
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--batch-size", type=int, default=2048)
     parser.add_argument("--lr", type=float, default=1.0e-3)
@@ -27,6 +39,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--branch-loss-weight", type=float, default=0.1)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--scheduler-kind", choices=("none", "plateau", "cosine"), default="plateau")
+    parser.add_argument("--warmup-epochs", type=int, default=0)
+    parser.add_argument("--min-lr", type=float, default=1.0e-6)
+    parser.add_argument("--plateau-factor", type=float, default=0.5)
+    parser.add_argument("--plateau-patience", type=int)
+    parser.add_argument("--lbfgs-epochs", type=int, default=0)
+    parser.add_argument("--lbfgs-lr", type=float, default=0.25)
+    parser.add_argument("--lbfgs-max-iter", type=int, default=20)
+    parser.add_argument("--lbfgs-history-size", type=int, default=100)
+    parser.add_argument("--log-every-epochs", type=int, default=0)
+    parser.add_argument("--stress-weight-alpha", type=float, default=0.0)
+    parser.add_argument("--stress-weight-scale", type=float, default=250.0)
     return parser.parse_args()
 
 
@@ -49,6 +73,18 @@ def main() -> None:
         branch_loss_weight=args.branch_loss_weight,
         num_workers=args.num_workers,
         device=args.device,
+        scheduler_kind=args.scheduler_kind,
+        warmup_epochs=args.warmup_epochs,
+        min_lr=args.min_lr,
+        plateau_factor=args.plateau_factor,
+        plateau_patience=args.plateau_patience,
+        lbfgs_epochs=args.lbfgs_epochs,
+        lbfgs_lr=args.lbfgs_lr,
+        lbfgs_max_iter=args.lbfgs_max_iter,
+        lbfgs_history_size=args.lbfgs_history_size,
+        log_every_epochs=args.log_every_epochs,
+        stress_weight_alpha=args.stress_weight_alpha,
+        stress_weight_scale=args.stress_weight_scale,
     )
     summary = train_model(config)
     print(json.dumps(summary, indent=2))

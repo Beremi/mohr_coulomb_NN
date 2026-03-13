@@ -8,9 +8,7 @@ import numpy as np
 
 from .voigt import (
     principal_values_and_vectors_from_strain,
-    reconstruct_from_principal,
     strain_voigt_to_tensor,
-    tensor_to_stress_voigt,
 )
 
 BRANCH_NAMES = ("elastic", "smooth", "left_edge", "right_edge", "apex")
@@ -34,6 +32,62 @@ class ConstitutiveResult:
 def _broadcast_materials(n: int, *arrays: np.ndarray | float) -> list[np.ndarray]:
     out = np.broadcast_arrays(*[np.asarray(a, dtype=float) for a in arrays])
     return [a.reshape(-1) if a.size == n else np.broadcast_to(a, (n,)).reshape(-1) for a in out]
+
+
+_IOTA = np.array([1.0, 1.0, 1.0, 0.0, 0.0, 0.0], dtype=float)
+
+
+def _strain_to_stress_notation(strain_eng: np.ndarray) -> np.ndarray:
+    """Convert engineering Voigt strain to the MATLAB routine's stress notation."""
+    strain = np.asarray(strain_eng, dtype=float)
+    out = strain.copy()
+    out[:, 3:] *= 0.5
+    return out
+
+
+def _square_in_stress_notation(strain_stress_notation: np.ndarray) -> np.ndarray:
+    """Return the Voigt representation of E_tr^2 used by the MATLAB routine."""
+    e = np.asarray(strain_stress_notation, dtype=float)
+    out = np.empty_like(e)
+    out[:, 0] = e[:, 0] ** 2 + e[:, 3] ** 2 + e[:, 5] ** 2
+    out[:, 1] = e[:, 1] ** 2 + e[:, 3] ** 2 + e[:, 4] ** 2
+    out[:, 2] = e[:, 2] ** 2 + e[:, 4] ** 2 + e[:, 5] ** 2
+    out[:, 3] = e[:, 0] * e[:, 3] + e[:, 1] * e[:, 3] + e[:, 4] * e[:, 5]
+    out[:, 4] = e[:, 3] * e[:, 5] + e[:, 1] * e[:, 4] + e[:, 2] * e[:, 4]
+    out[:, 5] = e[:, 0] * e[:, 5] + e[:, 3] * e[:, 4] + e[:, 2] * e[:, 5]
+    return out
+
+
+def _matlab_principal_strains(strain_eng: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute the trial-strain invariants and ordered principal values using the
+    same closed-form formulas as the upstream MATLAB constitutive routine.
+    """
+    e_tr = _strain_to_stress_notation(strain_eng)
+    e_sq = _square_in_stress_notation(e_tr)
+
+    i1 = e_tr[:, 0] + e_tr[:, 1] + e_tr[:, 2]
+    i2 = e_tr[:, 0] * e_tr[:, 1] + e_tr[:, 0] * e_tr[:, 2] + e_tr[:, 1] * e_tr[:, 2]
+    i2 -= e_tr[:, 3] ** 2 + e_tr[:, 4] ** 2 + e_tr[:, 5] ** 2
+    i3 = e_tr[:, 0] * e_tr[:, 1] * e_tr[:, 2]
+    i3 -= e_tr[:, 2] * e_tr[:, 3] ** 2
+    i3 -= e_tr[:, 1] * e_tr[:, 5] ** 2
+    i3 -= e_tr[:, 0] * e_tr[:, 4] ** 2
+    i3 += 2.0 * e_tr[:, 3] * e_tr[:, 4] * e_tr[:, 5]
+
+    q = np.maximum(0.0, (i1**2 - 3.0 * i2) / 9.0)
+    r = (-2.0 * i1**3 + 9.0 * i1 * i2 - 27.0 * i3) / 54.0
+    theta0 = np.zeros_like(i1)
+    mask = q > 0.0
+    theta0[mask] = r[mask] / np.sqrt(q[mask] ** 3)
+    theta = np.arccos(np.clip(theta0, -1.0, 1.0)) / 3.0
+    sqrt_q = np.sqrt(q)
+
+    eig1 = -2.0 * sqrt_q * np.cos(theta + 2.0 * np.pi / 3.0) + i1 / 3.0
+    eig2 = -2.0 * sqrt_q * np.cos(theta - 2.0 * np.pi / 3.0) + i1 / 3.0
+    eig3 = -2.0 * sqrt_q * np.cos(theta) + i1 / 3.0
+    eigvals = np.column_stack([eig1, eig2, eig3])
+    return eigvals, e_tr, e_sq, i1
 
 
 def constitutive_update_3d(
@@ -76,12 +130,11 @@ def constitutive_update_3d(
     c_bar, sin_phi, shear, bulk, lame = _broadcast_materials(n, c_bar, sin_phi, shear, bulk, lame)
     sin_psi = sin_phi.copy()
 
-    eigvals, eigvecs = principal_values_and_vectors_from_strain(strain)
+    eigvals, e_tr, e_sq, i1 = _matlab_principal_strains(strain)
+    _, eigvecs = principal_values_and_vectors_from_strain(strain)
     e1 = eigvals[:, 0]
     e2 = eigvals[:, 1]
     e3 = eigvals[:, 2]
-    i1 = e1 + e2 + e3
-
     f_trial = 2.0 * shear * ((1.0 + sin_phi) * e1 - (1.0 - sin_phi) * e3) + 2.0 * (lame * sin_phi) * i1 - c_bar
 
     gamma_sl = (e1 - e2) / np.maximum(1.0 + sin_psi, 1.0e-14)
@@ -146,16 +199,16 @@ def constitutive_update_3d(
     branch_id[test_a] = BRANCH_TO_ID["apex"]
 
     stress_principal = np.zeros((n, 3), dtype=float)
-    stress_tensor = np.zeros((n, 3, 3), dtype=float)
+    stress = np.zeros((n, 6), dtype=float)
     plastic_multiplier = np.zeros(n, dtype=float)
-    eye = np.eye(3, dtype=float)[None, :, :]
 
     sigma_trial = lame[:, None] * i1[:, None] + 2.0 * shear[:, None] * eigvals
 
     if np.any(test_el):
         idx = np.where(test_el)[0]
         stress_principal[idx] = sigma_trial[idx]
-        stress_tensor[idx] = reconstruct_from_principal(stress_principal[idx], eigvecs[idx])
+        stress[idx] = lame[idx, None] * i1[idx, None] * _IOTA[None, :]
+        stress[idx] += 2.0 * shear[idx, None] * e_tr[idx]
 
     if np.any(test_s):
         idx = np.where(test_s)[0]
@@ -169,7 +222,13 @@ def constitutive_update_3d(
         s2 = ll * i1s + 2.0 * mu * e2[idx] - lam * (2.0 * ll * sp)
         s3 = ll * i1s + 2.0 * mu * e3[idx] - lam * (2.0 * ll * sp - 2.0 * mu * (1.0 - sp))
         stress_principal[idx] = np.column_stack([s1, s2, s3])
-        stress_tensor[idx] = reconstruct_from_principal(stress_principal[idx], eigvecs[idx])
+        denom1 = np.where(np.abs((e1[idx] - e2[idx]) * (e1[idx] - e3[idx])) > 1.0e-14, (e1[idx] - e2[idx]) * (e1[idx] - e3[idx]), np.inf)
+        denom2 = np.where(np.abs((e2[idx] - e1[idx]) * (e2[idx] - e3[idx])) > 1.0e-14, (e2[idx] - e1[idx]) * (e2[idx] - e3[idx]), np.inf)
+        denom3 = np.where(np.abs((e3[idx] - e1[idx]) * (e3[idx] - e2[idx])) > 1.0e-14, (e3[idx] - e1[idx]) * (e3[idx] - e2[idx]), np.inf)
+        eig1_proj = (e_sq[idx] - (e2[idx] + e3[idx])[:, None] * e_tr[idx] + (e2[idx] * e3[idx])[:, None] * _IOTA[None, :]) / denom1[:, None]
+        eig2_proj = (e_sq[idx] - (e1[idx] + e3[idx])[:, None] * e_tr[idx] + (e1[idx] * e3[idx])[:, None] * _IOTA[None, :]) / denom2[:, None]
+        eig3_proj = (e_sq[idx] - (e1[idx] + e2[idx])[:, None] * e_tr[idx] + (e1[idx] * e2[idx])[:, None] * _IOTA[None, :]) / denom3[:, None]
+        stress[idx] = s1[:, None] * eig1_proj + s2[:, None] * eig2_proj + s3[:, None] * eig3_proj
 
     if np.any(test_l):
         idx = np.where(test_l)[0]
@@ -182,9 +241,10 @@ def constitutive_update_3d(
         sigma12 = ll * i1l + mu * (e1[idx] + e2[idx]) - lam * (2.0 * ll * sp + mu * (1.0 + sp))
         sigma3 = ll * i1l + 2.0 * mu * e3[idx] - lam * (2.0 * ll * sp - 2.0 * mu * (1.0 - sp))
         stress_principal[idx] = np.column_stack([sigma12, sigma12, sigma3])
-        v3 = eigvecs[idx, :, 2]
-        p3 = np.einsum("ni,nj->nij", v3, v3)
-        stress_tensor[idx] = sigma12[:, None, None] * (eye[:, :, :] - p3) + sigma3[:, None, None] * p3
+        denom3 = np.where(np.abs((e3[idx] - e1[idx]) * (e3[idx] - e2[idx])) > 1.0e-14, (e3[idx] - e1[idx]) * (e3[idx] - e2[idx]), np.inf)
+        eig3_proj = (e_sq[idx] - (e1[idx] + e2[idx])[:, None] * e_tr[idx] + (e1[idx] * e2[idx])[:, None] * _IOTA[None, :]) / denom3[:, None]
+        eig12_proj = _IOTA[None, :] - eig3_proj
+        stress[idx] = sigma12[:, None] * eig12_proj + sigma3[:, None] * eig3_proj
 
     if np.any(test_r):
         idx = np.where(test_r)[0]
@@ -197,9 +257,10 @@ def constitutive_update_3d(
         sigma1 = ll * i1r + 2.0 * mu * e1[idx] - lam * (2.0 * ll * sp + 2.0 * mu * (1.0 + sp))
         sigma23 = ll * i1r + mu * (e2[idx] + e3[idx]) - lam * (2.0 * ll * sp - mu * (1.0 - sp))
         stress_principal[idx] = np.column_stack([sigma1, sigma23, sigma23])
-        v1 = eigvecs[idx, :, 0]
-        p1 = np.einsum("ni,nj->nij", v1, v1)
-        stress_tensor[idx] = sigma1[:, None, None] * p1 + sigma23[:, None, None] * (eye[:, :, :] - p1)
+        denom1 = np.where(np.abs((e1[idx] - e2[idx]) * (e1[idx] - e3[idx])) > 1.0e-14, (e1[idx] - e2[idx]) * (e1[idx] - e3[idx]), np.inf)
+        eig1_proj = (e_sq[idx] - (e2[idx] + e3[idx])[:, None] * e_tr[idx] + (e2[idx] * e3[idx])[:, None] * _IOTA[None, :]) / denom1[:, None]
+        eig23_proj = _IOTA[None, :] - eig1_proj
+        stress[idx] = sigma1[:, None] * eig1_proj + sigma23[:, None] * eig23_proj
 
     if np.any(test_a):
         idx = np.where(test_a)[0]
@@ -207,9 +268,7 @@ def constitutive_update_3d(
         sigma_a = c_bar[idx] / denom
         plastic_multiplier[idx] = lambda_a[idx]
         stress_principal[idx] = np.column_stack([sigma_a, sigma_a, sigma_a])
-        stress_tensor[idx] = sigma_a[:, None, None] * np.eye(3)[None, :, :]
-
-    stress = tensor_to_stress_voigt(stress_tensor)
+        stress[idx] = sigma_a[:, None] * _IOTA[None, :]
 
     tangent = None
     if return_tangent:

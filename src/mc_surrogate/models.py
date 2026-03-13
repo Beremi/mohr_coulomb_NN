@@ -89,6 +89,56 @@ def build_raw_features(
     ).astype(np.float32)
 
 
+def build_trial_features(
+    strain_eng: np.ndarray,
+    material_reduced: np.ndarray,
+) -> np.ndarray:
+    """
+    Build raw-stress features around the elastic trial stress.
+
+    This representation is better aligned with the actual return mapping and is
+    more stable on real simulation states with very large signed strain ranges.
+    """
+    strain_eng = np.asarray(strain_eng, dtype=float)
+    mat = np.asarray(material_reduced, dtype=float)
+    c_bar = mat[:, 0]
+    sin_phi = np.clip(mat[:, 1], -0.999999, 0.999999)
+    shear = mat[:, 2]
+    bulk = mat[:, 3]
+    lame = mat[:, 4]
+
+    trial = compute_trial_stress(strain_eng, material_reduced)
+
+    scale = np.maximum(c_bar, 1.0)
+    return np.column_stack(
+        [
+            np.arcsinh(strain_eng),
+            np.arcsinh(trial / scale[:, None]),
+            _safe_log(c_bar),
+            np.arctanh(sin_phi),
+            _safe_log(shear),
+            _safe_log(bulk),
+            _safe_log(lame),
+        ]
+    ).astype(np.float32)
+
+
+def compute_trial_stress(
+    strain_eng: np.ndarray,
+    material_reduced: np.ndarray,
+) -> np.ndarray:
+    """Compute elastic trial stress in Voigt notation from engineering strain."""
+    strain_eng = np.asarray(strain_eng, dtype=float)
+    mat = np.asarray(material_reduced, dtype=float)
+    shear = mat[:, 2]
+    lame = mat[:, 4]
+    trace = np.sum(strain_eng[:, :3], axis=1)
+    trial = np.empty_like(strain_eng, dtype=float)
+    trial[:, :3] = lame[:, None] * trace[:, None] + 2.0 * shear[:, None] * strain_eng[:, :3]
+    trial[:, 3:] = shear[:, None] * strain_eng[:, 3:]
+    return trial.astype(np.float32)
+
+
 @dataclass
 class Standardizer:
     """Feature or target standardization parameters."""
@@ -193,6 +243,36 @@ class RawStressNet(nn.Module):
         return {"stress": self.head_stress(h)}
 
 
+class RawStressBranchNet(nn.Module):
+    """Raw-stress MLP with an auxiliary branch classification head."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        width: int = 256,
+        depth: int = 4,
+        dropout: float = 0.0,
+        n_branches: int = 5,
+    ) -> None:
+        super().__init__()
+        self.input = nn.Sequential(
+            nn.Linear(input_dim, width),
+            nn.GELU(),
+        )
+        self.blocks = nn.ModuleList([ResidualBlock(width, dropout=dropout) for _ in range(depth)])
+        self.head_stress = nn.Linear(width, 6)
+        self.head_branch = nn.Linear(width, n_branches)
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        h = self.input(x)
+        for block in self.blocks:
+            h = block(h)
+        return {
+            "stress": self.head_stress(h),
+            "branch_logits": self.head_branch(h),
+        }
+
+
 def build_model(
     model_kind: str,
     input_dim: int,
@@ -203,8 +283,10 @@ def build_model(
     """Factory for supported surrogate architectures."""
     if model_kind == "principal":
         return PrincipalStressNet(input_dim=input_dim, width=width, depth=depth, dropout=dropout)
-    if model_kind == "raw":
+    if model_kind in {"raw", "trial_raw", "trial_raw_residual"}:
         return RawStressNet(input_dim=input_dim, width=width, depth=depth, dropout=dropout)
+    if model_kind in {"raw_branch", "trial_raw_branch", "trial_raw_branch_residual"}:
+        return RawStressBranchNet(input_dim=input_dim, width=width, depth=depth, dropout=dropout)
     raise ValueError(f"Unsupported model kind {model_kind!r}.")
 
 

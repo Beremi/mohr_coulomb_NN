@@ -8,6 +8,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
+import h5py
 import numpy as np
 import torch
 from torch import nn
@@ -19,11 +20,14 @@ from .models import (
     build_model,
     build_principal_features,
     build_raw_features,
+    build_trial_features,
+    compute_trial_stress,
     spectral_decomposition_from_strain,
     stress_voigt_from_principal_numpy,
     stress_voigt_from_principal_torch,
 )
 from .mohr_coulomb import BRANCH_NAMES
+from .voigt import stress_voigt_to_tensor
 
 
 def choose_device(device: str = "auto") -> torch.device:
@@ -55,10 +59,15 @@ class TrainingConfig:
     scheduler_kind: str = "plateau"
     warmup_epochs: int = 0
     min_lr: float = 1.0e-6
+    plateau_factor: float = 0.5
+    plateau_patience: int | None = None
     lbfgs_epochs: int = 0
     lbfgs_lr: float = 0.25
     lbfgs_max_iter: int = 20
     lbfgs_history_size: int = 100
+    log_every_epochs: int = 0
+    stress_weight_alpha: float = 0.0
+    stress_weight_scale: float = 250.0
 
 
 def set_seed(seed: int) -> None:
@@ -69,34 +78,103 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _dataset_keys(dataset_path: str) -> set[str]:
+    with h5py.File(dataset_path, "r") as f:
+        return set(f.keys())
+
+
+def _principal_stress_from_stress(stress_voigt: np.ndarray) -> np.ndarray:
+    tensor = stress_voigt_to_tensor(stress_voigt)
+    vals = np.linalg.eigvalsh(tensor)
+    return vals[:, ::-1].astype(np.float32)
+
+
+def _is_principal_model(model_kind: str) -> bool:
+    return model_kind == "principal"
+
+
+def _uses_raw_features(model_kind: str) -> bool:
+    return model_kind in {"raw", "raw_branch"}
+
+
+def _uses_trial_features(model_kind: str) -> bool:
+    return model_kind in {
+        "trial_raw",
+        "trial_raw_branch",
+        "trial_raw_residual",
+        "trial_raw_branch_residual",
+    }
+
+
+def _uses_residual_target(model_kind: str) -> bool:
+    return model_kind in {"trial_raw_residual", "trial_raw_branch_residual"}
+
+
 def _load_split_for_training(dataset_path: str, split: str, model_kind: str) -> dict[str, np.ndarray]:
-    keys = ["strain_eng", "stress", "stress_principal", "material_reduced", "branch_id", "eigvecs"]
+    available = _dataset_keys(dataset_path)
+    keys = ["strain_eng", "stress", "material_reduced"]
+    optional = ["stress_principal", "branch_id", "eigvecs"]
+    keys.extend([key for key in optional if key in available])
     arrays = load_arrays(dataset_path, keys, split=split)
 
-    if model_kind == "principal":
+    stress_principal = arrays.get("stress_principal")
+    if stress_principal is None:
+        stress_principal = _principal_stress_from_stress(arrays["stress"])
+    branch_id = arrays.get("branch_id")
+    if branch_id is None:
+        branch_id = np.full(arrays["strain_eng"].shape[0], -1, dtype=np.int64)
+    else:
+        branch_id = branch_id.astype(np.int64)
+
+    trial_stress = compute_trial_stress(arrays["strain_eng"], arrays["material_reduced"])
+
+    if _is_principal_model(model_kind):
         # Recompute principal strains from the stored engineering strain so the
         # training features remain self-contained and consistent with inference.
         strain_principal, eigvecs = spectral_decomposition_from_strain(arrays["strain_eng"])
         features = build_principal_features(strain_principal, arrays["material_reduced"])
-        target = arrays["stress_principal"].astype(np.float32)
+        target = stress_principal.astype(np.float32)
         out = {
             "features": features,
             "target": target,
             "stress_true": arrays["stress"].astype(np.float32),
-            "branch_id": arrays["branch_id"].astype(np.int64),
+            "branch_id": branch_id,
             "eigvecs": eigvecs.astype(np.float32),
+            "trial_stress": np.zeros_like(arrays["stress"], dtype=np.float32),
         }
         return out
 
-    if model_kind == "raw":
+    if _uses_raw_features(model_kind):
         features = build_raw_features(arrays["strain_eng"], arrays["material_reduced"])
         target = arrays["stress"].astype(np.float32)
+        eigvecs = arrays.get("eigvecs")
+        if eigvecs is None:
+            _, eigvecs = spectral_decomposition_from_strain(arrays["strain_eng"])
         return {
             "features": features,
             "target": target,
             "stress_true": arrays["stress"].astype(np.float32),
-            "branch_id": arrays["branch_id"].astype(np.int64),
-            "eigvecs": arrays["eigvecs"].astype(np.float32),
+            "branch_id": branch_id,
+            "eigvecs": eigvecs.astype(np.float32),
+            "trial_stress": trial_stress.astype(np.float32),
+        }
+
+    if _uses_trial_features(model_kind):
+        features = build_trial_features(arrays["strain_eng"], arrays["material_reduced"])
+        if _uses_residual_target(model_kind):
+            target = (arrays["stress"] - trial_stress).astype(np.float32)
+        else:
+            target = arrays["stress"].astype(np.float32)
+        eigvecs = arrays.get("eigvecs")
+        if eigvecs is None:
+            _, eigvecs = spectral_decomposition_from_strain(arrays["strain_eng"])
+        return {
+            "features": features,
+            "target": target,
+            "stress_true": arrays["stress"].astype(np.float32),
+            "branch_id": branch_id,
+            "eigvecs": eigvecs.astype(np.float32),
+            "trial_stress": trial_stress.astype(np.float32),
         }
 
     raise ValueError(f"Unsupported model kind {model_kind!r}.")
@@ -112,7 +190,8 @@ def _build_tensor_dataset(
     branch = torch.from_numpy(split_arrays["branch_id"])
     stress_true = torch.from_numpy(split_arrays["stress_true"])
     eigvecs = torch.from_numpy(split_arrays["eigvecs"])
-    return TensorDataset(x, y, branch, stress_true, eigvecs)
+    trial_stress = torch.from_numpy(split_arrays["trial_stress"])
+    return TensorDataset(x, y, branch, stress_true, eigvecs, trial_stress)
 
 
 def _regression_loss(
@@ -122,16 +201,27 @@ def _regression_loss(
     y_scaler: Standardizer,
     eigvecs: torch.Tensor,
     stress_true: torch.Tensor,
+    trial_stress: torch.Tensor,
+    stress_weight_alpha: float,
+    stress_weight_scale: float,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    mse = nn.functional.mse_loss(pred_norm, target_norm)
+    per_sample_mse = torch.mean((pred_norm - target_norm) ** 2, dim=1)
+    if stress_weight_alpha > 0.0:
+        sample_mag = torch.amax(torch.abs(stress_true), dim=1)
+        weights = 1.0 + stress_weight_alpha * torch.log1p(sample_mag / max(stress_weight_scale, 1.0e-12))
+        mse = torch.mean(weights * per_sample_mse)
+    else:
+        mse = torch.mean(per_sample_mse)
     metrics = {"regression_mse": float(mse.detach().cpu())}
 
     pred = pred_norm * torch.as_tensor(y_scaler.std, device=pred_norm.device) + torch.as_tensor(
         y_scaler.mean, device=pred_norm.device
     )
 
-    if model_kind == "principal":
+    if _is_principal_model(model_kind):
         stress_pred = stress_voigt_from_principal_torch(pred, eigvecs)
+    elif _uses_residual_target(model_kind):
+        stress_pred = pred + trial_stress
     else:
         stress_pred = pred
 
@@ -150,6 +240,8 @@ def _epoch_loop(
     branch_loss_weight: float,
     device: torch.device,
     grad_clip: float,
+    stress_weight_alpha: float,
+    stress_weight_scale: float,
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
@@ -159,14 +251,16 @@ def _epoch_loop(
     total_stress = 0.0
     total_branch = 0.0
     total_branch_correct = 0.0
+    n_branch_samples = 0
     n_samples = 0
 
-    for xb, yb, branch, stress_true, eigvecs in loader:
+    for xb, yb, branch, stress_true, eigvecs, trial_stress in loader:
         xb = xb.to(device)
         yb = yb.to(device)
         branch = branch.to(device)
         stress_true = stress_true.to(device)
         eigvecs = eigvecs.to(device)
+        trial_stress = trial_stress.to(device)
 
         if training:
             optimizer.zero_grad(set_to_none=True)
@@ -179,6 +273,9 @@ def _epoch_loop(
             y_scaler=y_scaler,
             eigvecs=eigvecs,
             stress_true=stress_true,
+            trial_stress=trial_stress,
+            stress_weight_alpha=stress_weight_alpha,
+            stress_weight_scale=stress_weight_scale,
         )
 
         loss = reg_loss
@@ -186,11 +283,14 @@ def _epoch_loop(
         branch_acc_value = 0.0
 
         if "branch_logits" in out:
-            branch_loss = nn.functional.cross_entropy(out["branch_logits"], branch)
-            loss = loss + branch_loss_weight * branch_loss
-            branch_loss_value = float(branch_loss.detach().cpu())
-            pred_branch = out["branch_logits"].argmax(dim=1)
-            branch_acc_value = float((pred_branch == branch).float().mean().detach().cpu())
+            valid_branch = branch >= 0
+            if torch.any(valid_branch):
+                branch_loss = nn.functional.cross_entropy(out["branch_logits"][valid_branch], branch[valid_branch])
+                loss = loss + branch_loss_weight * branch_loss
+                branch_loss_value = float(branch_loss.detach().cpu())
+                pred_branch = out["branch_logits"][valid_branch].argmax(dim=1)
+                branch_acc_value = float((pred_branch == branch[valid_branch]).float().mean().detach().cpu())
+                n_branch_samples += int(valid_branch.sum().detach().cpu())
 
         if training:
             loss.backward()
@@ -202,16 +302,16 @@ def _epoch_loop(
         total_loss += float(loss.detach().cpu()) * batch_size
         total_reg += reg_metrics["regression_mse"] * batch_size
         total_stress += reg_metrics["stress_mse"] * batch_size
-        total_branch += branch_loss_value * batch_size
-        total_branch_correct += branch_acc_value * batch_size
+        total_branch += branch_loss_value * max(int((branch >= 0).sum().detach().cpu()), 0)
+        total_branch_correct += branch_acc_value * max(int((branch >= 0).sum().detach().cpu()), 0)
         n_samples += batch_size
 
     return {
         "loss": total_loss / max(n_samples, 1),
         "regression_mse": total_reg / max(n_samples, 1),
         "stress_mse": total_stress / max(n_samples, 1),
-        "branch_loss": total_branch / max(n_samples, 1),
-        "branch_accuracy": total_branch_correct / max(n_samples, 1),
+        "branch_loss": total_branch / max(n_branch_samples, 1),
+        "branch_accuracy": total_branch_correct / max(n_branch_samples, 1),
     }
 
 
@@ -224,11 +324,14 @@ def _build_scheduler(
         return None, "none"
 
     if config.scheduler_kind == "plateau":
+        plateau_patience = config.plateau_patience
+        if plateau_patience is None:
+            plateau_patience = max(3, config.patience // 4)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode="min",
-            factor=0.5,
-            patience=max(3, config.patience // 4),
+            factor=config.plateau_factor,
+            patience=plateau_patience,
             min_lr=config.min_lr,
         )
         return scheduler, "val"
@@ -294,6 +397,33 @@ def _write_history_row(
                 lbfgs_phase,
             ]
         )
+
+
+def _maybe_print_epoch_status(
+    *,
+    epoch: int,
+    lr: float,
+    train_metrics: dict[str, float],
+    val_metrics: dict[str, float],
+    best_val: float,
+    lbfgs_phase: int,
+    config: TrainingConfig,
+) -> None:
+    if config.log_every_epochs <= 0:
+        return
+    should_print = epoch == 1 or epoch % config.log_every_epochs == 0
+    if not should_print:
+        return
+    phase_name = "LBFGS" if lbfgs_phase else "Adam"
+    print(
+        f"[{phase_name}] epoch={epoch} "
+        f"lr={lr:.3e} "
+        f"train_loss={train_metrics['loss']:.6f} "
+        f"val_loss={val_metrics['loss']:.6f} "
+        f"train_stress_mse={train_metrics['stress_mse']:.6f} "
+        f"val_stress_mse={val_metrics['stress_mse']:.6f} "
+        f"best_val={best_val:.6f}"
+    )
 
 
 def train_model(config: TrainingConfig) -> dict[str, Any]:
@@ -373,6 +503,8 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
             branch_loss_weight=config.branch_loss_weight,
             device=device,
             grad_clip=config.grad_clip,
+            stress_weight_alpha=config.stress_weight_alpha,
+            stress_weight_scale=config.stress_weight_scale,
         )
         val_metrics = _epoch_loop(
             model=model,
@@ -383,6 +515,8 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
             branch_loss_weight=config.branch_loss_weight,
             device=device,
             grad_clip=config.grad_clip,
+            stress_weight_alpha=config.stress_weight_alpha,
+            stress_weight_scale=config.stress_weight_scale,
         )
 
         if scheduler is not None:
@@ -416,6 +550,16 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
         else:
             epochs_without_improvement += 1
 
+        _maybe_print_epoch_status(
+            epoch=epoch,
+            lr=current_lr,
+            train_metrics=train_metrics,
+            val_metrics=val_metrics,
+            best_val=best_val,
+            lbfgs_phase=0,
+            config=config,
+        )
+
         if epochs_without_improvement >= config.patience:
             break
 
@@ -433,7 +577,7 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
         )
 
         for lbfgs_epoch in range(1, config.lbfgs_epochs + 1):
-            xb, yb, branch, stress_true, eigvecs = train_full
+            xb, yb, branch, stress_true, eigvecs, trial_stress = train_full
 
             def closure() -> torch.Tensor:
                 lbfgs.zero_grad(set_to_none=True)
@@ -445,11 +589,16 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
                     y_scaler=y_scaler,
                     eigvecs=eigvecs,
                     stress_true=stress_true,
+                    trial_stress=trial_stress,
+                    stress_weight_alpha=config.stress_weight_alpha,
+                    stress_weight_scale=config.stress_weight_scale,
                 )
                 loss = reg_loss
                 if "branch_logits" in out:
-                    branch_loss = nn.functional.cross_entropy(out["branch_logits"], branch)
-                    loss = loss + config.branch_loss_weight * branch_loss
+                    valid_branch = branch >= 0
+                    if torch.any(valid_branch):
+                        branch_loss = nn.functional.cross_entropy(out["branch_logits"][valid_branch], branch[valid_branch])
+                        loss = loss + config.branch_loss_weight * branch_loss
                 loss.backward()
                 return loss
 
@@ -465,6 +614,8 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
                 branch_loss_weight=config.branch_loss_weight,
                 device=device,
                 grad_clip=config.grad_clip,
+                stress_weight_alpha=config.stress_weight_alpha,
+                stress_weight_scale=config.stress_weight_scale,
             )
             val_metrics = _epoch_loop(
                 model=model,
@@ -475,6 +626,8 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
                 branch_loss_weight=config.branch_loss_weight,
                 device=device,
                 grad_clip=config.grad_clip,
+                stress_weight_alpha=config.stress_weight_alpha,
+                stress_weight_scale=config.stress_weight_scale,
             )
             epoch = completed_epochs + lbfgs_epoch
             current_lr = lbfgs.param_groups[0]["lr"]
@@ -498,6 +651,15 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
                 best_epoch = epoch
                 torch.save(checkpoint, best_checkpoint_path)
             completed_epochs = epoch
+            _maybe_print_epoch_status(
+                epoch=epoch,
+                lr=current_lr,
+                train_metrics=train_metrics,
+                val_metrics=val_metrics,
+                best_val=best_val,
+                lbfgs_phase=1,
+                config=config,
+            )
 
     summary = {
         "best_val_loss": best_val,
@@ -514,7 +676,8 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
 
 def load_checkpoint(checkpoint_path: str | Path, device: str = "cpu") -> tuple[nn.Module, dict[str, Any]]:
     """Load a trained model checkpoint."""
-    ckpt = torch.load(checkpoint_path, map_location=torch.device(device))
+    device_obj = choose_device(device)
+    ckpt = torch.load(checkpoint_path, map_location=device_obj)
     metadata = ckpt["metadata"]
     cfg = metadata["config"]
     model = build_model(
@@ -535,10 +698,12 @@ def predict_with_checkpoint(
     material_reduced: np.ndarray,
     *,
     device: str = "cpu",
+    batch_size: int | None = None,
 ) -> dict[str, np.ndarray]:
     """Predict constitutive stresses using a saved checkpoint."""
     model, metadata = load_checkpoint(checkpoint_path, device=device)
-    model = model.to(torch.device(device))
+    device_obj = choose_device(device)
+    model = model.to(device_obj)
     cfg = metadata["config"]
     x_scaler = Standardizer.from_dict(metadata["x_scaler"])
     y_scaler = Standardizer.from_dict(metadata["y_scaler"])
@@ -546,22 +711,41 @@ def predict_with_checkpoint(
     strain_eng = np.asarray(strain_eng, dtype=float)
     material_reduced = np.asarray(material_reduced, dtype=float)
 
-    if cfg["model_kind"] == "principal":
+    if _is_principal_model(cfg["model_kind"]):
         strain_principal, eigvecs = spectral_decomposition_from_strain(strain_eng)
         features = build_principal_features(strain_principal, material_reduced)
-    else:
+    elif _uses_raw_features(cfg["model_kind"]):
         strain_principal, eigvecs = spectral_decomposition_from_strain(strain_eng)
         features = build_raw_features(strain_eng, material_reduced)
+    elif _uses_trial_features(cfg["model_kind"]):
+        strain_principal, eigvecs = spectral_decomposition_from_strain(strain_eng)
+        features = build_trial_features(strain_eng, material_reduced)
+    else:
+        raise ValueError(f"Unsupported model kind {cfg['model_kind']!r}.")
 
-    x = torch.from_numpy(x_scaler.transform(features)).to(torch.device(device))
+    if batch_size is None or batch_size <= 0:
+        batch_size = int(features.shape[0])
+
+    pred_chunks: list[np.ndarray] = []
+    branch_chunks: list[np.ndarray] = []
     with torch.no_grad():
-        out = model(x)
-        pred_norm = out["stress"].cpu().numpy()
+        for start in range(0, features.shape[0], batch_size):
+            stop = min(start + batch_size, features.shape[0])
+            x = torch.from_numpy(x_scaler.transform(features[start:stop])).to(device_obj)
+            out = model(x)
+            pred_chunks.append(out["stress"].cpu().numpy())
+            if "branch_logits" in out:
+                branch_chunks.append(out["branch_logits"].cpu().numpy())
+    pred_norm = np.concatenate(pred_chunks, axis=0)
     pred = y_scaler.inverse_transform(pred_norm)
+    trial_stress = compute_trial_stress(strain_eng, material_reduced)
 
-    if cfg["model_kind"] == "principal":
+    if _is_principal_model(cfg["model_kind"]):
         stress = stress_voigt_from_principal_numpy(pred, eigvecs)
         stress_principal = pred
+    elif _uses_residual_target(cfg["model_kind"]):
+        stress = pred + trial_stress
+        stress_principal = None
     else:
         stress = pred
         stress_principal = None
@@ -574,8 +758,8 @@ def predict_with_checkpoint(
     }
     if stress_principal is not None:
         result["stress_principal"] = stress_principal.astype(np.float32)
-    if "branch_logits" in out:
-        logits = out["branch_logits"].cpu().numpy()
+    if branch_chunks:
+        logits = np.concatenate(branch_chunks, axis=0)
         logits = logits - logits.max(axis=1, keepdims=True)
         probs = np.exp(logits)
         probs = probs / probs.sum(axis=1, keepdims=True)
@@ -589,20 +773,26 @@ def evaluate_checkpoint_on_dataset(
     *,
     split: str = "test",
     device: str = "cpu",
+    batch_size: int | None = None,
 ) -> dict[str, Any]:
     """Evaluate a checkpoint on a dataset split and return metrics and predictions."""
     model, metadata = load_checkpoint(checkpoint_path, device=device)
     cfg = metadata["config"]
-    arrays = load_arrays(
-        dataset_path,
-        ["strain_eng", "stress", "stress_principal", "material_reduced", "branch_id"],
-        split=split,
-    )
+    available = _dataset_keys(str(dataset_path))
+    keys = ["strain_eng", "stress", "material_reduced"]
+    if "stress_principal" in available:
+        keys.append("stress_principal")
+    if "branch_id" in available:
+        keys.append("branch_id")
+    arrays = load_arrays(dataset_path, keys, split=split)
+    if "stress_principal" not in arrays:
+        arrays["stress_principal"] = _principal_stress_from_stress(arrays["stress"])
     pred = predict_with_checkpoint(
         checkpoint_path,
         arrays["strain_eng"],
         arrays["material_reduced"],
         device=device,
+        batch_size=batch_size,
     )
     stress_pred = pred["stress"]
     stress_true = arrays["stress"]
@@ -623,7 +813,7 @@ def evaluate_checkpoint_on_dataset(
         metrics["principal_mae"] = float(np.mean(np.abs(stress_principal_pred - stress_principal_true)))
         metrics["principal_rmse"] = float(np.sqrt(np.mean((stress_principal_pred - stress_principal_true) ** 2)))
 
-    if pred["branch_probabilities"] is not None:
+    if pred["branch_probabilities"] is not None and "branch_id" in arrays and np.any(arrays["branch_id"] >= 0):
         branch_pred = np.argmax(pred["branch_probabilities"], axis=1)
         branch_true = arrays["branch_id"].astype(int)
         metrics["branch_accuracy"] = float(np.mean(branch_pred == branch_true))
@@ -635,12 +825,13 @@ def evaluate_checkpoint_on_dataset(
             for i in range(len(BRANCH_NAMES))
         ]
 
-    per_branch_mae = {}
-    for i, name in enumerate(BRANCH_NAMES):
-        mask = arrays["branch_id"] == i
-        if np.any(mask):
-            per_branch_mae[name] = float(np.mean(np.abs(stress_pred[mask] - stress_true[mask])))
-    metrics["per_branch_stress_mae"] = per_branch_mae
+    if "branch_id" in arrays and np.any(arrays["branch_id"] >= 0):
+        per_branch_mae = {}
+        for i, name in enumerate(BRANCH_NAMES):
+            mask = arrays["branch_id"] == i
+            if np.any(mask):
+                per_branch_mae[name] = float(np.mean(np.abs(stress_pred[mask] - stress_true[mask])))
+        metrics["per_branch_stress_mae"] = per_branch_mae
 
     return {
         "metrics": metrics,

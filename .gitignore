@@ -7,3 +7,9 @@ data/
 *.pt
 *.png
 *.json
+*.log
+
+# Generated experiment and notebook artifacts
+experiment_runs/
+notebook_runs/
+notebooks/*.executed.ipynb
