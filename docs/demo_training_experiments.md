@@ -6,11 +6,11 @@ The original demo notebook ran end to end, but the fit was unusable. This docume
 
 The experiment driver is:
 
-- [scripts/experiments/sweep_demo_training.py](/home/beremi/repos/mohr_coulomb_NN/scripts/experiments/sweep_demo_training.py)
+- [scripts/experiments/sweep_demo_training.py](../scripts/experiments/sweep_demo_training.py)
 
 The key implementation change that enabled stable demo datasets is the optional principal-strain cap added to:
 
-- [sampling.py](/home/beremi/repos/mohr_coulomb_NN/src/mc_surrogate/sampling.py)
+- [sampling.py](../src/mc_surrogate/sampling.py)
 
 ## Root cause of the bad first fit
 
@@ -36,7 +36,7 @@ That single scale outlier contaminated target standardization and pushed the tra
 
 Aggregate CSV:
 
-- [results.csv](/home/beremi/repos/mohr_coulomb_NN/experiment_runs/demo_sweep/results.csv)
+- [results.csv](../experiment_runs/demo_sweep/results.csv)
 
 ## Main findings
 
@@ -66,7 +66,7 @@ The final notebook uses the `focused_capped_large` configuration:
 
 This is the configuration transferred into:
 
-- [mohr_coulomb_demo.ipynb](/home/beremi/repos/mohr_coulomb_NN/notebooks/mohr_coulomb_demo.ipynb)
+- [mohr_coulomb_demo.ipynb](../notebooks/mohr_coulomb_demo.ipynb)
 
 ## Practical takeaways
 

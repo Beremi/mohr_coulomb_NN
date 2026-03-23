@@ -43,7 +43,7 @@ That is what finally made “new synthetic data every epoch” usable instead of
 
 ## Distribution Screening
 
-The useful screening run is in [cover_layer_fitted_refresh_smoke3.md](/home/beremi/repos/mohr_coulomb_NN/docs/cover_layer_fitted_refresh_smoke3.md).
+The useful screening run is in [cover_layer_fitted_refresh_smoke3.md](../docs/cover_layer_fitted_refresh_smoke3.md).
 
 Small-model screening on the corrected sampler family:
 

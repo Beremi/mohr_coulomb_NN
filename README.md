@@ -175,6 +175,8 @@ python scripts/compare_with_octave.py \
 - [Mohr-Coulomb constitutive law](docs/mohr_coulomb.md)
 - [Neural-network surrogate design](docs/neural_nets.md)
 - [Dataset generation rationale](docs/dataset_creation.md)
+- [Repository entry point and maintenance guide](docs/repo_entrypoint.md)
+- [Expert briefing on current surrogate status (2026-03-23)](docs/expert_briefing_20260323.md)
 
 ## Reference implementation and theory
 

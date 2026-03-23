@@ -2,7 +2,7 @@
 
 This plan combines:
 
-- the literature guidance summarized in [report.md](/home/beremi/repos/mohr_coulomb_NN/report.md)
+- the literature guidance summarized in [report.md](../report.md)
 - what has actually worked in this repository so far
 - the current bottlenecks observed on real sampled slope-stability data
 
@@ -15,7 +15,7 @@ What we already know from our own runs:
 - naive synthetic-only training was not enough
 - training on real sampled constitutive states was necessary
 - for the `cover_layer`, heavy epoch-refresh training with a fitted synthetic generator now works well
-- the current best cover-layer model is [best.pt](/home/beremi/repos/mohr_coulomb_NN/experiment_runs/real_sim/cover_layer_fitted_refresh_heavy_w1024_20260312/cover_raw_branch_w1024_d6_local_noise/best.pt)
+- the current best cover-layer model is [best.pt](../experiment_runs/real_sim/cover_layer_fitted_refresh_heavy_w1024_20260312/cover_raw_branch_w1024_d6_local_noise/best.pt)
 - that model reached real-test stress MAE `1.4951`, RMSE `9.7174`, branch accuracy `0.9577`
 - the remaining weak point is not average error; it is tail behavior and solver robustness
 

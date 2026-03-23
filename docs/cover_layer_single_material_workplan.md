@@ -12,7 +12,7 @@ The scope here is intentionally narrow:
 - we use everything we have now:
   - the current best cover-layer baseline
   - the new full export with `U` and `B`
-  - the paper-guided ideas from [report.md](/home/beremi/repos/mohr_coulomb_NN/report.md)
+  - the paper-guided ideas from [report.md](../report.md)
 
 This plan is designed to be executable, not aspirational.
 
@@ -27,20 +27,20 @@ Cover-layer raw material parameters in the repository are:
 - `poisson = 0.33`
 
 Reference:
-- [real_materials.py](/home/beremi/repos/mohr_coulomb_NN/src/mc_surrogate/real_materials.py)
+- [real_materials.py](../src/mc_surrogate/real_materials.py)
 
 In the heterogeneous mesh export, the cover layer corresponds to:
 
 - `material id = 0`
 
 Reference:
-- [full_export_inspection.md](/home/beremi/repos/mohr_coulomb_NN/docs/full_export_inspection.md)
+- [full_export_inspection.md](../docs/full_export_inspection.md)
 
 ## Current Baseline To Beat
 
 Current best cover-layer checkpoint:
 
-- [best.pt](/home/beremi/repos/mohr_coulomb_NN/experiment_runs/real_sim/cover_layer_fitted_refresh_heavy_w1024_20260312/cover_raw_branch_w1024_d6_local_noise/best.pt)
+- [best.pt](../experiment_runs/real_sim/cover_layer_fitted_refresh_heavy_w1024_20260312/cover_raw_branch_w1024_d6_local_noise/best.pt)
 
 Current best real-test metrics:
 
@@ -50,7 +50,7 @@ Current best real-test metrics:
 - branch accuracy: `0.9577`
 
 Reference:
-- [cover_layer_fitted_refresh_heavy_w1024_d6.md](/home/beremi/repos/mohr_coulomb_NN/docs/cover_layer_fitted_refresh_heavy_w1024_d6.md)
+- [cover_layer_fitted_refresh_heavy_w1024_d6.md](../docs/cover_layer_fitted_refresh_heavy_w1024_d6.md)
 
 Any new experiment should be compared against this, even if the new model itself does not explicitly output branch.
 
@@ -160,7 +160,7 @@ Purpose:
 
 Implementation:
 
-1. Extract all cover-layer integration-point states from [constitutive_problem_3D_full.h5](/home/beremi/repos/mohr_coulomb_NN/constitutive_problem_3D_full.h5).
+1. Extract all cover-layer integration-point states from [constitutive_problem_3D_full.h5](../constitutive_problem_3D_full.h5).
 2. Store:
    - `E`
    - `S`

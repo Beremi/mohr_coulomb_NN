@@ -123,6 +123,59 @@ def build_trial_features(
     ).astype(np.float32)
 
 
+def build_trial_principal_features(
+    strain_principal: np.ndarray,
+    material_reduced: np.ndarray,
+    trial_principal: np.ndarray,
+) -> np.ndarray:
+    """
+    Build principal/invariant features around the elastic trial principal stress.
+
+    This is intended for structured plastic-correction models: the network sees
+    ordered principal strains plus the corresponding elastic trial stress state
+    and learns only the non-elastic correction.
+    """
+    eps_p = np.asarray(strain_principal, dtype=float)
+    mat = np.asarray(material_reduced, dtype=float)
+    trial_p = np.asarray(trial_principal, dtype=float)
+    c_bar = mat[:, 0]
+    sin_phi = np.clip(mat[:, 1], -0.999999, 0.999999)
+    shear = mat[:, 2]
+    bulk = mat[:, 3]
+    lame = mat[:, 4]
+
+    trace_eps = np.sum(eps_p, axis=1)
+    eq_dev_eps = equivalent_deviatoric_measure(eps_p)
+    lode_eps = lode_cos3theta_from_principal(eps_p)
+    eps_gap_12 = eps_p[:, 0] - eps_p[:, 1]
+    eps_gap_23 = eps_p[:, 1] - eps_p[:, 2]
+
+    scale = np.maximum(c_bar, 1.0)
+    mean_trial = np.mean(trial_p, axis=1)
+    eq_dev_trial = equivalent_deviatoric_measure(trial_p)
+    lode_trial = lode_cos3theta_from_principal(trial_p)
+
+    return np.column_stack(
+        [
+            eps_p,
+            trace_eps,
+            eq_dev_eps,
+            lode_eps,
+            eps_gap_12,
+            eps_gap_23,
+            np.arcsinh(trial_p / scale[:, None]),
+            mean_trial / scale,
+            eq_dev_trial / scale,
+            lode_trial,
+            _safe_log(c_bar),
+            np.arctanh(sin_phi),
+            _safe_log(shear),
+            _safe_log(bulk),
+            _safe_log(lame),
+        ]
+    ).astype(np.float32)
+
+
 def compute_trial_stress(
     strain_eng: np.ndarray,
     material_reduced: np.ndarray,
@@ -198,8 +251,10 @@ class PrincipalStressNet(nn.Module):
         depth: int = 4,
         dropout: float = 0.0,
         n_branches: int = 5,
+        sort_output: bool = True,
     ) -> None:
         super().__init__()
+        self.sort_output = sort_output
         self.input = nn.Sequential(
             nn.Linear(input_dim, width),
             nn.GELU(),
@@ -213,7 +268,8 @@ class PrincipalStressNet(nn.Module):
         for block in self.blocks:
             h = block(h)
         stress = self.head_stress(h)
-        stress, _ = torch.sort(stress, dim=-1, descending=True)
+        if self.sort_output:
+            stress, _ = torch.sort(stress, dim=-1, descending=True)
         branch_logits = self.head_branch(h)
         return {"stress": stress, "branch_logits": branch_logits}
 
@@ -282,7 +338,9 @@ def build_model(
 ) -> nn.Module:
     """Factory for supported surrogate architectures."""
     if model_kind == "principal":
-        return PrincipalStressNet(input_dim=input_dim, width=width, depth=depth, dropout=dropout)
+        return PrincipalStressNet(input_dim=input_dim, width=width, depth=depth, dropout=dropout, sort_output=True)
+    if model_kind == "trial_principal_branch_residual":
+        return PrincipalStressNet(input_dim=input_dim, width=width, depth=depth, dropout=dropout, sort_output=False)
     if model_kind in {"raw", "trial_raw", "trial_raw_residual"}:
         return RawStressNet(input_dim=input_dim, width=width, depth=depth, dropout=dropout)
     if model_kind in {"raw_branch", "trial_raw_branch", "trial_raw_branch_residual"}:

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .branch_geometry import compute_branch_geometry_principal
 from .voigt import (
     principal_values_and_vectors_from_strain,
     strain_voigt_to_tensor,
@@ -29,12 +30,40 @@ class ConstitutiveResult:
     tangent: np.ndarray | None = None
 
 
+@dataclass
+class BranchHarmMetrics:
+    """Stress-based harm classification for predicted-vs-exact branch outcomes."""
+
+    exact_branch_id: np.ndarray
+    predicted_branch_id: np.ndarray
+    wrong_branch: np.ndarray
+    benign_fail: np.ndarray
+    harmful_fail: np.ndarray
+    adjacent_fail: np.ndarray
+    non_adjacent_fail: np.ndarray
+    harmful_adjacent_fail: np.ndarray
+    harmful_non_adjacent_fail: np.ndarray
+    rel_e_sigma: np.ndarray
+    abs_f_trial: np.ndarray
+    abs_gamma_sl_minus_lambda_s: np.ndarray
+    abs_gamma_sr_minus_lambda_s: np.ndarray
+    abs_gamma_la_minus_lambda_l: np.ndarray
+    abs_gamma_ra_minus_lambda_r: np.ndarray
+
+
 def _broadcast_materials(n: int, *arrays: np.ndarray | float) -> list[np.ndarray]:
     out = np.broadcast_arrays(*[np.asarray(a, dtype=float) for a in arrays])
     return [a.reshape(-1) if a.size == n else np.broadcast_to(a, (n,)).reshape(-1) for a in out]
 
 
 _IOTA = np.array([1.0, 1.0, 1.0, 0.0, 0.0, 0.0], dtype=float)
+_ADJACENT_BRANCH_PAIRS = {
+    (BRANCH_TO_ID["elastic"], BRANCH_TO_ID["smooth"]),
+    (BRANCH_TO_ID["smooth"], BRANCH_TO_ID["left_edge"]),
+    (BRANCH_TO_ID["smooth"], BRANCH_TO_ID["right_edge"]),
+    (BRANCH_TO_ID["left_edge"], BRANCH_TO_ID["apex"]),
+    (BRANCH_TO_ID["right_edge"], BRANCH_TO_ID["apex"]),
+}
 
 
 def _strain_to_stress_notation(strain_eng: np.ndarray) -> np.ndarray:
@@ -88,6 +117,304 @@ def _matlab_principal_strains(strain_eng: np.ndarray) -> tuple[np.ndarray, np.nd
     eig3 = -2.0 * sqrt_q * np.cos(theta) + i1 / 3.0
     eigvals = np.column_stack([eig1, eig2, eig3])
     return eigvals, e_tr, e_sq, i1
+
+
+def _coerce_strain_batch(strain_eng: np.ndarray) -> np.ndarray:
+    strain = np.asarray(strain_eng, dtype=float)
+    if strain.ndim == 1:
+        strain = strain[None, :]
+    if strain.ndim != 2 or strain.shape[1] != 6:
+        raise ValueError(f"Expected strain shape (n,6), got {strain.shape}.")
+    return strain
+
+
+def candidate_principal_stresses_3d(
+    strain_eng: np.ndarray,
+    c_bar: np.ndarray | float,
+    sin_phi: np.ndarray | float,
+    shear: np.ndarray | float,
+    bulk: np.ndarray | float,
+    lame: np.ndarray | float,
+) -> np.ndarray:
+    """
+    Return the principal-stress candidate for every Mohr-Coulomb branch.
+
+    Output shape is `(n, 5, 3)` ordered as:
+    `elastic, smooth, left_edge, right_edge, apex`.
+    """
+    strain = _coerce_strain_batch(strain_eng)
+    n = strain.shape[0]
+    c_bar, sin_phi, shear, bulk, lame = _broadcast_materials(n, c_bar, sin_phi, shear, bulk, lame)
+    sin_psi = sin_phi.copy()
+
+    eigvals, _e_tr, _e_sq, i1 = _matlab_principal_strains(strain)
+    e1 = eigvals[:, 0]
+    e2 = eigvals[:, 1]
+    e3 = eigvals[:, 2]
+    f_trial = 2.0 * shear * ((1.0 + sin_phi) * e1 - (1.0 - sin_phi) * e3) + 2.0 * (lame * sin_phi) * i1 - c_bar
+
+    denom_s = 4.0 * lame * sin_phi * sin_psi + 4.0 * shear * (1.0 + sin_phi * sin_psi)
+    denom_l = (
+        4.0 * lame * sin_phi * sin_psi
+        + shear * (1.0 + sin_phi) * (1.0 + sin_psi)
+        + 2.0 * shear * (1.0 - sin_phi) * (1.0 - sin_psi)
+    )
+    denom_r = (
+        4.0 * lame * sin_phi * sin_psi
+        + 2.0 * shear * (1.0 + sin_phi) * (1.0 + sin_psi)
+        + shear * (1.0 - sin_phi) * (1.0 - sin_psi)
+    )
+    denom_a = 4.0 * bulk * sin_phi * sin_psi
+
+    safe_denom_s = np.where(np.abs(denom_s) > 1.0e-14, denom_s, np.inf)
+    safe_denom_l = np.where(np.abs(denom_l) > 1.0e-14, denom_l, np.inf)
+    safe_denom_r = np.where(np.abs(denom_r) > 1.0e-14, denom_r, np.inf)
+    safe_denom_a = np.where(np.abs(denom_a) > 1.0e-14, denom_a, np.inf)
+
+    lambda_s = f_trial / safe_denom_s
+    lambda_l = (
+        shear * ((1.0 + sin_phi) * (e1 + e2) - 2.0 * (1.0 - sin_phi) * e3)
+        + 2.0 * lame * sin_phi * i1
+        - c_bar
+    ) / safe_denom_l
+    lambda_r = (
+        shear * (2.0 * (1.0 + sin_phi) * e1 - (1.0 - sin_phi) * (e2 + e3))
+        + 2.0 * lame * sin_phi * i1
+        - c_bar
+    ) / safe_denom_r
+
+    sigma_trial = lame[:, None] * i1[:, None] + 2.0 * shear[:, None] * eigvals
+    out = np.empty((n, len(BRANCH_NAMES), 3), dtype=float)
+    out[:, BRANCH_TO_ID["elastic"], :] = sigma_trial
+
+    s1 = lame * i1 + 2.0 * shear * e1 - lambda_s * (2.0 * lame * sin_psi + 2.0 * shear * (1.0 + sin_psi))
+    s2 = lame * i1 + 2.0 * shear * e2 - lambda_s * (2.0 * lame * sin_psi)
+    s3 = lame * i1 + 2.0 * shear * e3 - lambda_s * (2.0 * lame * sin_psi - 2.0 * shear * (1.0 - sin_psi))
+    out[:, BRANCH_TO_ID["smooth"], :] = np.column_stack([s1, s2, s3])
+
+    sigma12 = lame * i1 + shear * (e1 + e2) - lambda_l * (2.0 * lame * sin_psi + shear * (1.0 + sin_psi))
+    sigma3 = lame * i1 + 2.0 * shear * e3 - lambda_l * (2.0 * lame * sin_psi - 2.0 * shear * (1.0 - sin_psi))
+    out[:, BRANCH_TO_ID["left_edge"], :] = np.column_stack([sigma12, sigma12, sigma3])
+
+    sigma1 = lame * i1 + 2.0 * shear * e1 - lambda_r * (2.0 * lame * sin_psi + 2.0 * shear * (1.0 + sin_psi))
+    sigma23 = lame * i1 + shear * (e2 + e3) - lambda_r * (2.0 * lame * sin_psi - shear * (1.0 - sin_psi))
+    out[:, BRANCH_TO_ID["right_edge"], :] = np.column_stack([sigma1, sigma23, sigma23])
+
+    sigma_a = c_bar / np.where(np.abs(sin_phi) > 1.0e-12, 2.0 * sin_phi, np.inf)
+    out[:, BRANCH_TO_ID["apex"], :] = np.column_stack([sigma_a, sigma_a, sigma_a])
+    return out
+
+
+def candidate_stresses_3d(
+    strain_eng: np.ndarray,
+    c_bar: np.ndarray | float,
+    sin_phi: np.ndarray | float,
+    shear: np.ndarray | float,
+    bulk: np.ndarray | float,
+    lame: np.ndarray | float,
+) -> np.ndarray:
+    """Return full Voigt stress candidates for every branch with shape `(n, 5, 6)`."""
+    strain = _coerce_strain_batch(strain_eng)
+    n = strain.shape[0]
+    c_bar, sin_phi, shear, bulk, lame = _broadcast_materials(n, c_bar, sin_phi, shear, bulk, lame)
+    sin_psi = sin_phi.copy()
+
+    eigvals, e_tr, e_sq, i1 = _matlab_principal_strains(strain)
+    e1 = eigvals[:, 0]
+    e2 = eigvals[:, 1]
+    e3 = eigvals[:, 2]
+    f_trial = 2.0 * shear * ((1.0 + sin_phi) * e1 - (1.0 - sin_phi) * e3) + 2.0 * (lame * sin_phi) * i1 - c_bar
+
+    gamma_sl = (e1 - e2) / np.maximum(1.0 + sin_psi, 1.0e-14)
+    gamma_sr = (e2 - e3) / np.maximum(1.0 - sin_psi, 1.0e-14)
+    gamma_la = (e1 + e2 - 2.0 * e3) / np.maximum(3.0 - sin_psi, 1.0e-14)
+    gamma_ra = (2.0 * e1 - e2 - e3) / np.maximum(3.0 + sin_psi, 1.0e-14)
+
+    denom_s = 4.0 * lame * sin_phi * sin_psi + 4.0 * shear * (1.0 + sin_phi * sin_psi)
+    denom_l = (
+        4.0 * lame * sin_phi * sin_psi
+        + shear * (1.0 + sin_phi) * (1.0 + sin_psi)
+        + 2.0 * shear * (1.0 - sin_phi) * (1.0 - sin_psi)
+    )
+    denom_r = (
+        4.0 * lame * sin_phi * sin_psi
+        + 2.0 * shear * (1.0 + sin_phi) * (1.0 + sin_psi)
+        + shear * (1.0 - sin_phi) * (1.0 - sin_psi)
+    )
+    safe_denom_s = np.where(np.abs(denom_s) > 1.0e-14, denom_s, np.inf)
+    safe_denom_l = np.where(np.abs(denom_l) > 1.0e-14, denom_l, np.inf)
+    safe_denom_r = np.where(np.abs(denom_r) > 1.0e-14, denom_r, np.inf)
+
+    lambda_s = f_trial / safe_denom_s
+    lambda_l = (
+        shear * ((1.0 + sin_phi) * (e1 + e2) - 2.0 * (1.0 - sin_phi) * e3)
+        + 2.0 * lame * sin_phi * i1
+        - c_bar
+    ) / safe_denom_l
+    lambda_r = (
+        shear * (2.0 * (1.0 + sin_phi) * e1 - (1.0 - sin_phi) * (e2 + e3))
+        + 2.0 * lame * sin_phi * i1
+        - c_bar
+    ) / safe_denom_r
+
+    stress = np.zeros((n, len(BRANCH_NAMES), 6), dtype=float)
+    sigma_trial = lame[:, None] * i1[:, None] + 2.0 * shear[:, None] * eigvals
+    stress[:, BRANCH_TO_ID["elastic"], :] = lame[:, None] * i1[:, None] * _IOTA[None, :]
+    stress[:, BRANCH_TO_ID["elastic"], :] += 2.0 * shear[:, None] * e_tr
+
+    s1 = lame * i1 + 2.0 * shear * e1 - lambda_s * (2.0 * lame * sin_psi + 2.0 * shear * (1.0 + sin_psi))
+    s2 = lame * i1 + 2.0 * shear * e2 - lambda_s * (2.0 * lame * sin_psi)
+    s3 = lame * i1 + 2.0 * shear * e3 - lambda_s * (2.0 * lame * sin_psi - 2.0 * shear * (1.0 - sin_psi))
+    denom1 = np.where(np.abs((e1 - e2) * (e1 - e3)) > 1.0e-14, (e1 - e2) * (e1 - e3), np.inf)
+    denom2 = np.where(np.abs((e2 - e1) * (e2 - e3)) > 1.0e-14, (e2 - e1) * (e2 - e3), np.inf)
+    denom3 = np.where(np.abs((e3 - e1) * (e3 - e2)) > 1.0e-14, (e3 - e1) * (e3 - e2), np.inf)
+    eig1_proj = (e_sq - (e2 + e3)[:, None] * e_tr + (e2 * e3)[:, None] * _IOTA[None, :]) / denom1[:, None]
+    eig2_proj = (e_sq - (e1 + e3)[:, None] * e_tr + (e1 * e3)[:, None] * _IOTA[None, :]) / denom2[:, None]
+    eig3_proj = (e_sq - (e1 + e2)[:, None] * e_tr + (e1 * e2)[:, None] * _IOTA[None, :]) / denom3[:, None]
+    stress[:, BRANCH_TO_ID["smooth"], :] = s1[:, None] * eig1_proj + s2[:, None] * eig2_proj + s3[:, None] * eig3_proj
+
+    sigma12 = lame * i1 + shear * (e1 + e2) - lambda_l * (2.0 * lame * sin_psi + shear * (1.0 + sin_psi))
+    sigma3 = lame * i1 + 2.0 * shear * e3 - lambda_l * (2.0 * lame * sin_psi - 2.0 * shear * (1.0 - sin_psi))
+    eig12_proj = _IOTA[None, :] - eig3_proj
+    stress[:, BRANCH_TO_ID["left_edge"], :] = sigma12[:, None] * eig12_proj + sigma3[:, None] * eig3_proj
+
+    sigma1 = lame * i1 + 2.0 * shear * e1 - lambda_r * (2.0 * lame * sin_psi + 2.0 * shear * (1.0 + sin_psi))
+    sigma23 = lame * i1 + shear * (e2 + e3) - lambda_r * (2.0 * lame * sin_psi - shear * (1.0 - sin_psi))
+    eig23_proj = _IOTA[None, :] - eig1_proj
+    stress[:, BRANCH_TO_ID["right_edge"], :] = sigma1[:, None] * eig1_proj + sigma23[:, None] * eig23_proj
+
+    sigma_a = c_bar / np.where(np.abs(sin_phi) > 1.0e-12, 2.0 * sin_phi, np.inf)
+    stress[:, BRANCH_TO_ID["apex"], :] = sigma_a[:, None] * _IOTA[None, :]
+    return stress
+
+
+def dispatch_branch_stress_3d(
+    strain_eng: np.ndarray,
+    branch_id: np.ndarray | int,
+    c_bar: np.ndarray | float,
+    sin_phi: np.ndarray | float,
+    shear: np.ndarray | float,
+    bulk: np.ndarray | float,
+    lame: np.ndarray | float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Dispatch branch ids through the exact branch formulas and return `(stress, principal_stress)`."""
+    strain = _coerce_strain_batch(strain_eng)
+    branch = np.asarray(branch_id, dtype=np.int64).reshape(-1)
+    if branch.size == 1 and strain.shape[0] > 1:
+        branch = np.full(strain.shape[0], int(branch.item()), dtype=np.int64)
+    if branch.shape[0] != strain.shape[0]:
+        raise ValueError(f"Branch ids shape {branch.shape} does not match strain batch {strain.shape[0]}.")
+    if np.any((branch < 0) | (branch >= len(BRANCH_NAMES))):
+        raise ValueError("Branch ids must be in [0, 4].")
+    principal_candidates = candidate_principal_stresses_3d(
+        strain,
+        c_bar=c_bar,
+        sin_phi=sin_phi,
+        shear=shear,
+        bulk=bulk,
+        lame=lame,
+    )
+    stress_candidates = candidate_stresses_3d(
+        strain,
+        c_bar=c_bar,
+        sin_phi=sin_phi,
+        shear=shear,
+        bulk=bulk,
+        lame=lame,
+    )
+    rows = np.arange(strain.shape[0], dtype=np.int64)
+    return stress_candidates[rows, branch], principal_candidates[rows, branch]
+
+
+def _adjacent_branch_mask(exact_branch_id: np.ndarray, predicted_branch_id: np.ndarray) -> np.ndarray:
+    exact = np.asarray(exact_branch_id, dtype=np.int64).reshape(-1)
+    pred = np.asarray(predicted_branch_id, dtype=np.int64).reshape(-1)
+    out = np.zeros(exact.shape[0], dtype=bool)
+    for left, right in _ADJACENT_BRANCH_PAIRS:
+        out |= ((exact == left) & (pred == right)) | ((exact == right) & (pred == left))
+    return out
+
+
+def branch_harm_metrics_3d(
+    strain_eng: np.ndarray,
+    predicted_branch_id: np.ndarray | int,
+    c_bar: np.ndarray | float,
+    sin_phi: np.ndarray | float,
+    shear: np.ndarray | float,
+    bulk: np.ndarray | float,
+    lame: np.ndarray | float,
+    *,
+    tau: float = 1.0e-2,
+) -> BranchHarmMetrics:
+    """
+    Classify wrong branch predictions as benign or harmful using principal-stress error.
+    """
+    strain = _coerce_strain_batch(strain_eng)
+    n = strain.shape[0]
+    pred = np.asarray(predicted_branch_id, dtype=np.int64).reshape(-1)
+    if pred.size == 1 and n > 1:
+        pred = np.full(n, int(pred.item()), dtype=np.int64)
+    if pred.shape[0] != n:
+        raise ValueError(f"Predicted branch ids shape {pred.shape} does not match strain batch {n}.")
+    if np.any((pred < 0) | (pred >= len(BRANCH_NAMES))):
+        raise ValueError("Predicted branch ids must be in [0, 4].")
+
+    exact = constitutive_update_3d(
+        strain,
+        c_bar=c_bar,
+        sin_phi=sin_phi,
+        shear=shear,
+        bulk=bulk,
+        lame=lame,
+        return_tangent=False,
+    )
+    _pred_stress, pred_principal = dispatch_branch_stress_3d(
+        strain,
+        pred,
+        c_bar=c_bar,
+        sin_phi=sin_phi,
+        shear=shear,
+        bulk=bulk,
+        lame=lame,
+    )
+    c_bar_arr, sin_phi_arr, shear_arr, bulk_arr, lame_arr = _broadcast_materials(n, c_bar, sin_phi, shear, bulk, lame)
+    geom = compute_branch_geometry_principal(
+        exact.strain_principal,
+        c_bar=c_bar_arr,
+        sin_phi=sin_phi_arr,
+        shear=shear_arr,
+        bulk=bulk_arr,
+        lame=lame_arr,
+    )
+
+    exact_branch = np.asarray(exact.branch_id, dtype=np.int64).reshape(-1)
+    wrong = pred != exact_branch
+    denom = np.linalg.norm(exact.stress_principal, axis=1) + np.maximum(c_bar_arr, 0.0) + 1.0e-12
+    rel_e_sigma = np.linalg.norm(pred_principal - exact.stress_principal, axis=1) / denom
+    harmful = wrong & (rel_e_sigma > tau)
+    benign = wrong & ~harmful
+    adjacent = wrong & _adjacent_branch_mask(exact_branch, pred)
+    non_adjacent = wrong & ~adjacent
+    harmful_adjacent = harmful & adjacent
+    harmful_non_adjacent = harmful & non_adjacent
+
+    return BranchHarmMetrics(
+        exact_branch_id=exact_branch,
+        predicted_branch_id=pred,
+        wrong_branch=wrong,
+        benign_fail=benign,
+        harmful_fail=harmful,
+        adjacent_fail=adjacent,
+        non_adjacent_fail=non_adjacent,
+        harmful_adjacent_fail=harmful_adjacent,
+        harmful_non_adjacent_fail=harmful_non_adjacent,
+        rel_e_sigma=rel_e_sigma.astype(float),
+        abs_f_trial=np.abs(exact.f_trial).astype(float),
+        abs_gamma_sl_minus_lambda_s=np.abs(geom.gamma_sl - geom.lambda_s).astype(float),
+        abs_gamma_sr_minus_lambda_s=np.abs(geom.gamma_sr - geom.lambda_s).astype(float),
+        abs_gamma_la_minus_lambda_l=np.abs(geom.gamma_la - geom.lambda_l).astype(float),
+        abs_gamma_ra_minus_lambda_r=np.abs(geom.gamma_ra - geom.lambda_r).astype(float),
+    )
 
 
 def constitutive_update_3d(

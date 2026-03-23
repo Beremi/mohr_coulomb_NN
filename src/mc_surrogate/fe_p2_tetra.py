@@ -175,6 +175,39 @@ def build_local_b_pool(
         raise ValueError(f"No elements found for material_id={material_id}.")
 
     local_coords = coord[elem[element_index]]
+    b_blocks = build_local_b_blocks_from_coords(local_coords)
+    n_elem = local_coords.shape[0]
+    n_q = b_blocks.shape[1]
+    b_blocks = b_blocks.reshape(n_elem * n_q, 6, 30)
+    local_coords_ip = np.repeat(local_coords, repeats=n_q, axis=0)
+    corner_coords = local_coords_ip[:, :4, :]
+    char_length = characteristic_length_from_corners(corner_coords)
+    corner_volume = corner_signed_volumes(corner_coords)
+
+    bb_t = np.einsum("nij,nkj->nik", b_blocks, b_blocks)
+    eye6 = np.eye(6, dtype=np.float64)[None, :, :]
+    inv_term = np.linalg.inv(bb_t + right_inverse_damping * eye6)
+    right_inverse = np.einsum("nji,njk->nik", b_blocks, inv_term)
+
+    q_index = np.tile(np.arange(n_q, dtype=np.int16), n_elem)
+    e_index_ip = np.repeat(element_index.astype(np.int32), repeats=n_q)
+    return LocalIntegrationPointPool(
+        local_coords=local_coords_ip.astype(np.float32),
+        b_blocks=b_blocks.astype(np.float32),
+        right_inverse=right_inverse.astype(np.float32),
+        characteristic_length=char_length.astype(np.float32),
+        corner_volume=corner_volume.astype(np.float32),
+        element_index=e_index_ip,
+        quadrature_index=q_index,
+    )
+
+
+def build_local_b_blocks_from_coords(local_coords: np.ndarray) -> np.ndarray:
+    """Build local P2 tetrahedral B blocks for coordinates of shape (n_elem, 10, 3)."""
+    local_coords = np.asarray(local_coords, dtype=np.float64)
+    if local_coords.ndim != 3 or local_coords.shape[1:] != (10, 3):
+        raise ValueError(f"Expected local_coords shape (n_elem, 10, 3), got {local_coords.shape}.")
+
     xi, _ = quadrature_volume_p2_tetra()
     dh1, dh2, dh3 = local_basis_derivatives_p2_tetra(xi)
     n_elem = local_coords.shape[0]
@@ -237,29 +270,7 @@ def build_local_b_pool(
             bq[:, 5, c + 1] = d3n
             bq[:, 5, c + 2] = d2n
         b_blocks[:, q] = bq
-
-    b_blocks = b_blocks.reshape(n_elem * n_q, 6, 30)
-    local_coords_ip = np.repeat(local_coords, repeats=n_q, axis=0)
-    corner_coords = local_coords_ip[:, :4, :]
-    char_length = characteristic_length_from_corners(corner_coords)
-    corner_volume = corner_signed_volumes(corner_coords)
-
-    bb_t = np.einsum("nij,nkj->nik", b_blocks, b_blocks)
-    eye6 = np.eye(6, dtype=np.float64)[None, :, :]
-    inv_term = np.linalg.inv(bb_t + right_inverse_damping * eye6)
-    right_inverse = np.einsum("nji,njk->nik", b_blocks, inv_term)
-
-    q_index = np.tile(np.arange(n_q, dtype=np.int16), n_elem)
-    e_index_ip = np.repeat(element_index.astype(np.int32), repeats=n_q)
-    return LocalIntegrationPointPool(
-        local_coords=local_coords_ip.astype(np.float32),
-        b_blocks=b_blocks.astype(np.float32),
-        right_inverse=right_inverse.astype(np.float32),
-        characteristic_length=char_length.astype(np.float32),
-        corner_volume=corner_volume.astype(np.float32),
-        element_index=e_index_ip,
-        quadrature_index=q_index,
-    )
+    return b_blocks.astype(np.float32)
 
 
 def strain_from_local_displacements(b_block: np.ndarray, displacements: np.ndarray) -> np.ndarray:
