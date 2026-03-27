@@ -17,10 +17,10 @@ Read this first.
 - Date: `2026-03-27`
 - Canonical closeout for the absorbed historical report stack: `docs/repository_general_report_20260326.md`
 - Canonical closeout for the local cover-layer prehistory: `docs/cover_layer_comprehensive_report_20260326.md`
-- Last executed program: `projection-student reopen audit and bounded projected-student run`
+- Last executed program: `projection-student preservation/compression packet`
 - Current program state: `continue_projection_student`
-- Reason: the exact Phase 0 principal-space projection audit preserved the raw teacher's stress quality while driving yield violation to numerical zero, and the bounded Phase 2 medium projected student beat packet2 on validation while preserving admissibility
-- `DS` status: still blocked
+- Reason: the exact projected teacher remains solver-credible on forward stress, the March 27 same-capacity preservation control materially beat the March 26 `medium_exact` student on validation, but the preserved student still missed the Tier 1 `hard_p95 <= 180` gate, so the route stays alive only in a narrowed preservation-first mode and compression remains closed
+- `DS` status: still blocked; the projected-teacher probe was mixed and the preserved student remains well above the reopen bar
 
 ## Projection-Student Outcome
 
@@ -70,6 +70,60 @@ Current decision after this reopen:
 - continue the `projection-student` line
 - keep `DS` blocked for now
 - do not reopen packet5 / new routing / new atlas / exact-latent follow-ons from this state
+
+## Projection-Student Preservation / Compression Outcome
+
+The March 27 strategic brief tightened the live direct-replacement route from “project a student” to “preserve the projected teacher first, compress second”.
+
+Implemented artifacts live under:
+
+- `experiment_runs/real_sim/projection_student_preservation_compression_20260327/`
+- `docs/tasks/projection_student_preservation_compression_work_packet_20260327.md`
+- `docs/executions/projection_student_preservation_compression_work_packet_20260327.md`
+
+Phase A0 candidate-zero freeze:
+
+- full-row teacher projection cache built at `experiment_runs/real_sim/projection_student_preservation_compression_20260327/exp0_teacher_cache/teacher_projection_preservation_cache.h5`
+- validation projected teacher broad / hard / p95 / yield: `5.877489 / 7.062693 / 76.398941 / 2.199150e-08`
+- test projected teacher broad / hard / p95 / yield: `6.083902 / 7.344495 / 79.955505 / 2.252151e-08`
+- cache includes exact stress, projected / dispatched teacher stress, projection displacement, selected candidate, split ids, hard masks, `ds_valid` masks, branch ids, and boundary-nearness masks for all `283648` rows
+
+Phase A1 projected-teacher `DS` probe:
+
+- directional finite-difference probe executed on canonical `ds_valid_val` / `ds_valid_test` using `3` random unit directions per row and both `exact` and `softmin(tau=0.05)` projection modes
+- overall packet probe status: `mixed`
+- validation / test probe status: `blocked` / `mixed`
+- validation softmin forward stress-component MAE vs exact projection: `1.012578`
+- test softmin forward stress-component MAE vs exact projection: `0.969067`
+- candidate-switch rates remained very small, but directional tangent relative-error tails stayed too large for a `DS` reopen
+
+Phase B preservation path:
+
+- preservation dataset built at `experiment_runs/real_sim/projection_student_preservation_compression_20260327/exp2_preservation_dataset/projection_student_preservation_plastic.h5`
+- preservation dataset rows: `236700`
+- split counts: `166254 / 34343 / 36103`
+- dataset now includes projected-teacher provisional / projected / delta principal targets, candidate ids, displacement norms, `ds_valid_mask`, and `sampling_weight`
+
+Phase B1 same-capacity preservation control:
+
+- model: `trial_principal_geom_projected_student`, `256x4`, `540935` params, exact projection, warm-started from `candidate_b`
+- validation broad / hard / p95 / yield: `16.891312 / 19.413279 / 196.215149 / 2.329866e-08`
+- test broad / hard / p95 / yield: `17.608580 / 20.012241 / 201.945511 / 2.342785e-08`
+- vs March 26 `medium_exact` validation (`27.308128 / 29.599710 / 250.701462 / 2.270879e-08`): materially better on all three stress metrics while preserving numerical-zero yield
+- Tier 1 opening gate `<= 18 / <= 20 / <= 180 / <= 1e-6`: `False` because `hard_p95_principal` remained at `196.215149`
+
+Phase C compression decision:
+
+- Tier 1 compression: `skipped`
+- Tier 2 compression: `skipped`
+- reason: the same-capacity preservation control materially improved the line but did not clear the explicit Tier 1 opening gate, so bounded compression is not yet justified
+
+Current decision after the March 27 preservation/compression packet:
+
+- continue the `projection-student` route only in narrowed preservation-first mode
+- keep `DS` blocked
+- do not open Tier 1 / Tier 2 compression yet
+- focus any immediate follow-on on closing the remaining hard-tail (`p95`) gap to the projected teacher before reopening compression or broader tangent work
 
 ## Final Program X Outcome
 
@@ -239,6 +293,7 @@ Packet4 final validation winner:
 Projection-student root:
 
 - `experiment_runs/real_sim/projection_student_20260326/`
+- `experiment_runs/real_sim/projection_student_preservation_compression_20260327/`
 
 Key projection-student outputs:
 
@@ -251,6 +306,11 @@ Key projection-student outputs:
 - Winner checkpoint: `experiment_runs/real_sim/projection_student_20260326/exp2_projected_student/medium_exact/best.pt`
 - Winner validation/test metrics: `experiment_runs/real_sim/projection_student_20260326/exp2_projected_student/medium_exact/projected_student_eval_val.json`, `experiment_runs/real_sim/projection_student_20260326/exp2_projected_student/medium_exact/projected_student_eval_test.json`
 - Phase 3 status: `experiment_runs/real_sim/projection_student_20260326/exp3_ds_probe/ds_probe_summary.json`
+- March 27 teacher cache summary: `experiment_runs/real_sim/projection_student_preservation_compression_20260327/exp0_teacher_cache/teacher_projection_preservation_summary.json`
+- March 27 teacher `DS` probe summary: `experiment_runs/real_sim/projection_student_preservation_compression_20260327/exp1_teacher_ds_probe/teacher_ds_probe_summary.json`
+- March 27 preservation dataset summary: `experiment_runs/real_sim/projection_student_preservation_compression_20260327/exp2_preservation_dataset/preservation_dataset_summary.json`
+- March 27 preservation control summary: `experiment_runs/real_sim/projection_student_preservation_compression_20260327/exp3_preservation_control/phase3_summary.json`
+- March 27 compression decisions: `experiment_runs/real_sim/projection_student_preservation_compression_20260327/exp4_tier1_compression/phase4_summary.json`, `experiment_runs/real_sim/projection_student_preservation_compression_20260327/exp5_tier2_compression/phase5_summary.json`
 
 Program X root:
 

@@ -561,7 +561,21 @@ def _load_split_for_training(
 ) -> dict[str, np.ndarray]:
     available = _dataset_keys(dataset_path)
     keys = ["strain_eng", "stress", "material_reduced"]
-    optional = ["stress_principal", "branch_id", "eigvecs", "hard_mask", "plastic_mask", "teacher_stress_principal"]
+    optional = [
+        "stress_principal",
+        "branch_id",
+        "eigvecs",
+        "hard_mask",
+        "plastic_mask",
+        "teacher_stress_principal",
+        "teacher_provisional_stress_principal",
+        "teacher_projected_stress_principal",
+        "teacher_projection_delta_principal",
+        "teacher_projection_candidate_id",
+        "teacher_projection_disp_norm",
+        "ds_valid_mask",
+        "sampling_weight",
+    ]
     if include_tangent and "tangent" in available:
         optional.append("tangent")
     elif include_tangent and "DS" in available:
@@ -572,6 +586,10 @@ def _load_split_for_training(
                 optional.append(key)
     if _is_surface_model(model_kind):
         for key in ("surface_feature_f1", "soft_atlas_feature_f1", "soft_atlas_route_target", "trial_principal", "trial_stress"):
+            if key in available:
+                optional.append(key)
+    if model_kind in {"trial_principal_geom_plastic_branch_residual", "trial_principal_geom_projected_student"}:
+        for key in ("trial_principal_geom_feature_f1", "trial_principal", "trial_stress"):
             if key in available:
                 optional.append(key)
     keys.extend([key for key in optional if key in available])
@@ -591,11 +609,39 @@ def _load_split_for_training(
     plastic_mask = arrays.get("plastic_mask")
     if plastic_mask is not None:
         plastic_mask = plastic_mask.astype(bool)
-    teacher_stress_principal = arrays.get("teacher_stress_principal")
-    if teacher_stress_principal is None:
-        teacher_stress_principal = stress_principal.astype(np.float32)
+    teacher_provisional_stress_principal = arrays.get("teacher_provisional_stress_principal")
+    if teacher_provisional_stress_principal is None:
+        teacher_provisional_stress_principal = arrays.get("teacher_stress_principal")
+    if teacher_provisional_stress_principal is None:
+        teacher_provisional_stress_principal = stress_principal.astype(np.float32)
     else:
-        teacher_stress_principal = teacher_stress_principal.astype(np.float32)
+        teacher_provisional_stress_principal = teacher_provisional_stress_principal.astype(np.float32)
+    teacher_projected_stress_principal = arrays.get("teacher_projected_stress_principal")
+    if teacher_projected_stress_principal is None:
+        teacher_projected_stress_principal = np.full_like(stress_principal, np.nan, dtype=np.float32)
+    else:
+        teacher_projected_stress_principal = teacher_projected_stress_principal.astype(np.float32)
+    teacher_projection_delta_principal = arrays.get("teacher_projection_delta_principal")
+    if teacher_projection_delta_principal is None:
+        teacher_projection_delta_principal = np.full_like(stress_principal, np.nan, dtype=np.float32)
+    else:
+        teacher_projection_delta_principal = teacher_projection_delta_principal.astype(np.float32)
+    teacher_projection_candidate_id = arrays.get("teacher_projection_candidate_id")
+    if teacher_projection_candidate_id is None:
+        teacher_projection_candidate_id = np.full(arrays["strain_eng"].shape[0], -1, dtype=np.int64)
+    else:
+        teacher_projection_candidate_id = teacher_projection_candidate_id.astype(np.int64)
+    teacher_projection_disp_norm = arrays.get("teacher_projection_disp_norm")
+    if teacher_projection_disp_norm is None:
+        teacher_projection_disp_norm = np.full(arrays["strain_eng"].shape[0], np.nan, dtype=np.float32)
+    else:
+        teacher_projection_disp_norm = teacher_projection_disp_norm.astype(np.float32)
+    ds_valid_mask = arrays.get("ds_valid_mask")
+    if ds_valid_mask is not None:
+        ds_valid_mask = ds_valid_mask.astype(bool)
+    sampling_weight = arrays.get("sampling_weight")
+    if sampling_weight is not None:
+        sampling_weight = sampling_weight.astype(np.float32)
 
     prepared = None
     if _is_acn_model(model_kind):
@@ -728,7 +774,10 @@ def _load_split_for_training(
             target = _transform_grho_target(grho_true, coordinate_scales, arrays["material_reduced"])
     else:
         prepared = _prepare_model_inputs(model_kind, arrays["strain_eng"], arrays["material_reduced"])
-        features = prepared["features"].astype(np.float32)
+        if model_kind in {"trial_principal_geom_plastic_branch_residual", "trial_principal_geom_projected_student"} and "trial_principal_geom_feature_f1" in arrays:
+            features = arrays["trial_principal_geom_feature_f1"].astype(np.float32)
+        else:
+            features = prepared["features"].astype(np.float32)
 
     if _is_projected_student_model(model_kind):
         target = (stress_principal.astype(np.float32) - prepared["trial_principal"]).astype(np.float32)
@@ -765,11 +814,17 @@ def _load_split_for_training(
         "grho_true": (grho_true.astype(np.float32) if _is_surface_model(model_kind) else np.full((arrays["stress"].shape[0], 2), np.nan, dtype=np.float32)),
         "strain_eng": arrays["strain_eng"].astype(np.float32),
         "material_reduced": arrays["material_reduced"].astype(np.float32),
-        "teacher_stress_principal": teacher_stress_principal.astype(np.float32),
+        "teacher_provisional_stress_principal": teacher_provisional_stress_principal.astype(np.float32),
+        "teacher_projected_stress_principal": teacher_projected_stress_principal.astype(np.float32),
+        "teacher_projection_delta_principal": teacher_projection_delta_principal.astype(np.float32),
+        "teacher_projection_candidate_id": teacher_projection_candidate_id.astype(np.int64),
+        "teacher_projection_disp_norm": teacher_projection_disp_norm.astype(np.float32),
         "hard_mask": (hard_mask.astype(bool) if hard_mask is not None else np.zeros(arrays["strain_eng"].shape[0], dtype=bool)),
         "plastic_mask": (
             plastic_mask.astype(bool) if plastic_mask is not None else (branch_id > 0)
         ),
+        "ds_valid_mask": (ds_valid_mask.astype(bool) if ds_valid_mask is not None else np.zeros(arrays["strain_eng"].shape[0], dtype=bool)),
+        "sampling_weight": sampling_weight,
         "tangent_true": tangent_out,
     }
 
@@ -793,7 +848,9 @@ def _build_tensor_dataset(
     soft_atlas_route_target = torch.from_numpy(split_arrays["soft_atlas_route_target"])
     strain_eng = torch.from_numpy(split_arrays["strain_eng"])
     material_reduced = torch.from_numpy(split_arrays["material_reduced"])
-    teacher_stress_principal = torch.from_numpy(split_arrays["teacher_stress_principal"])
+    teacher_provisional_stress_principal = torch.from_numpy(split_arrays["teacher_provisional_stress_principal"])
+    teacher_projected_stress_principal = torch.from_numpy(split_arrays["teacher_projected_stress_principal"])
+    teacher_projection_delta_principal = torch.from_numpy(split_arrays["teacher_projection_delta_principal"])
     tangent_true = split_arrays.get("tangent_true")
     if tangent_true is None:
         tangent = torch.full((x.shape[0], 6, 6), float("nan"), dtype=torch.float32)
@@ -814,7 +871,9 @@ def _build_tensor_dataset(
         soft_atlas_route_target,
         strain_eng,
         material_reduced,
-        teacher_stress_principal,
+        teacher_provisional_stress_principal,
+        teacher_projected_stress_principal,
+        teacher_projection_delta_principal,
         tangent,
     )
 
@@ -1245,7 +1304,9 @@ def _regression_loss(
     grho_true: torch.Tensor,
     soft_route_target: torch.Tensor | None,
     material_reduced: torch.Tensor,
-    teacher_stress_principal: torch.Tensor,
+    teacher_provisional_stress_principal: torch.Tensor,
+    teacher_projected_stress_principal: torch.Tensor,
+    teacher_projection_delta_principal: torch.Tensor,
     branch_logits: torch.Tensor | None,
     stress_weight_alpha: float,
     stress_weight_scale: float,
@@ -1274,7 +1335,9 @@ def _regression_loss(
             principal_pred_sel = principal_pred[valid]
             principal_true_sel = stress_principal_true[valid]
             provisional_sel = provisional_principal[valid]
-            teacher_sel = teacher_stress_principal[valid]
+            teacher_provisional_sel = teacher_provisional_stress_principal[valid]
+            teacher_projected_sel = teacher_projected_stress_principal[valid]
+            teacher_delta_sel = teacher_projection_delta_principal[valid]
             c_bar_sel = material_reduced[valid, 0]
             branch_logits_sel = branch_logits[valid] if branch_logits is not None else None
             branch_target = branch_true[valid] - 1
@@ -1284,33 +1347,67 @@ def _regression_loss(
             principal_pred_sel = principal_pred[:1]
             principal_true_sel = stress_principal_true[:1]
             provisional_sel = provisional_principal[:1]
-            teacher_sel = teacher_stress_principal[:1]
+            teacher_provisional_sel = teacher_provisional_stress_principal[:1]
+            teacher_projected_sel = teacher_projected_stress_principal[:1]
+            teacher_delta_sel = teacher_projection_delta_principal[:1]
             c_bar_sel = material_reduced[:1, 0]
             branch_logits_sel = branch_logits[:1] if branch_logits is not None else None
             branch_target = torch.zeros((1,), dtype=torch.long, device=pred_norm.device)
 
+        use_preservation_targets = bool(
+            torch.isfinite(teacher_projected_sel).all().detach().cpu()
+            and torch.isfinite(teacher_delta_sel).all().detach().cpu()
+        )
         principal_huber = nn.functional.huber_loss(principal_pred_sel, principal_true_sel, delta=huber_delta)
         stress_mae = torch.mean(torch.abs(stress_pred_sel - stress_true_sel))
-        teacher_huber = nn.functional.huber_loss(provisional_sel, teacher_sel, delta=huber_delta)
-        disp_norm = torch.linalg.norm(principal_pred_sel - provisional_sel, dim=1)
-        disp_denom = torch.linalg.norm(teacher_sel, dim=1) + c_bar_sel + 1.0
-        disp_penalty = torch.mean(disp_norm / torch.clamp(disp_denom, min=1.0e-12))
         if branch_logits_sel is not None:
             branch_ce = nn.functional.cross_entropy(branch_logits_sel, branch_target)
         else:
             branch_ce = pred_norm.new_tensor(0.0)
 
-        total = principal_huber + 0.5 * stress_mae + 0.25 * teacher_huber + 0.05 * disp_penalty + 0.05 * branch_ce
-        metrics = {
-            "regression_mse": float(torch.mean((principal_pred_sel - principal_true_sel) ** 2).detach().cpu()),
-            "stress_mse": float(torch.mean((stress_pred - stress_true) ** 2).detach().cpu()),
-            "stress_mae": float(torch.mean(torch.abs(stress_pred - stress_true)).detach().cpu()),
-            "principal_mse": float(torch.mean((principal_pred - stress_principal_true) ** 2).detach().cpu()),
-            "projection_disp_loss": float(disp_penalty.detach().cpu()),
-            "projection_disp_mean": float(torch.mean(torch.linalg.norm(principal_pred_sel - provisional_sel, dim=1)).detach().cpu()),
-            "teacher_huber_loss": float(teacher_huber.detach().cpu()),
-            "branch_ce_loss": float(branch_ce.detach().cpu()),
-        }
+        if use_preservation_targets:
+            projected_teacher_huber = nn.functional.huber_loss(principal_pred_sel, teacher_projected_sel, delta=huber_delta)
+            provisional_teacher_huber = nn.functional.huber_loss(provisional_sel, teacher_provisional_sel, delta=huber_delta)
+            projection_delta_student = principal_pred_sel - provisional_sel
+            projection_delta_huber = nn.functional.huber_loss(
+                projection_delta_student,
+                teacher_delta_sel,
+                delta=huber_delta,
+            )
+            total = (
+                1.00 * principal_huber
+                + 0.75 * projected_teacher_huber
+                + 0.50 * provisional_teacher_huber
+                + 0.25 * projection_delta_huber
+                + 0.10 * branch_ce
+            )
+            metrics = {
+                "regression_mse": float(torch.mean((principal_pred_sel - principal_true_sel) ** 2).detach().cpu()),
+                "stress_mse": float(torch.mean((stress_pred - stress_true) ** 2).detach().cpu()),
+                "stress_mae": float(torch.mean(torch.abs(stress_pred - stress_true)).detach().cpu()),
+                "principal_mse": float(torch.mean((principal_pred - stress_principal_true) ** 2).detach().cpu()),
+                "projected_teacher_huber_loss": float(projected_teacher_huber.detach().cpu()),
+                "provisional_teacher_huber_loss": float(provisional_teacher_huber.detach().cpu()),
+                "projection_delta_huber_loss": float(projection_delta_huber.detach().cpu()),
+                "projection_disp_mean": float(torch.mean(torch.linalg.norm(principal_pred_sel - provisional_sel, dim=1)).detach().cpu()),
+                "branch_ce_loss": float(branch_ce.detach().cpu()),
+            }
+        else:
+            teacher_huber = nn.functional.huber_loss(provisional_sel, teacher_provisional_sel, delta=huber_delta)
+            disp_norm = torch.linalg.norm(principal_pred_sel - provisional_sel, dim=1)
+            disp_denom = torch.linalg.norm(teacher_provisional_sel, dim=1) + c_bar_sel + 1.0
+            disp_penalty = torch.mean(disp_norm / torch.clamp(disp_denom, min=1.0e-12))
+            total = principal_huber + 0.5 * stress_mae + 0.25 * teacher_huber + 0.05 * disp_penalty + 0.05 * branch_ce
+            metrics = {
+                "regression_mse": float(torch.mean((principal_pred_sel - principal_true_sel) ** 2).detach().cpu()),
+                "stress_mse": float(torch.mean((stress_pred - stress_true) ** 2).detach().cpu()),
+                "stress_mae": float(torch.mean(torch.abs(stress_pred - stress_true)).detach().cpu()),
+                "principal_mse": float(torch.mean((principal_pred - stress_principal_true) ** 2).detach().cpu()),
+                "projection_disp_loss": float(disp_penalty.detach().cpu()),
+                "projection_disp_mean": float(torch.mean(torch.linalg.norm(principal_pred_sel - provisional_sel, dim=1)).detach().cpu()),
+                "teacher_huber_loss": float(teacher_huber.detach().cpu()),
+                "branch_ce_loss": float(branch_ce.detach().cpu()),
+            }
         return total, metrics
 
     if _is_soft_atlas_surface_model(model_kind):
@@ -1781,7 +1878,7 @@ def _epoch_loop(
     n_branch_samples = 0
     n_samples = 0
 
-    for xb, yb, branch, stress_true, stress_principal_true, eigvecs, trial_stress, trial_principal, abr_true_raw, abr_true_nonneg, grho_true, soft_atlas_route_target, strain_eng, material_reduced, teacher_stress_principal, tangent_true in loader:
+    for xb, yb, branch, stress_true, stress_principal_true, eigvecs, trial_stress, trial_principal, abr_true_raw, abr_true_nonneg, grho_true, soft_atlas_route_target, strain_eng, material_reduced, teacher_provisional_stress_principal, teacher_projected_stress_principal, teacher_projection_delta_principal, tangent_true in loader:
         xb = xb.to(device)
         yb = yb.to(device)
         branch = branch.to(device)
@@ -1796,7 +1893,9 @@ def _epoch_loop(
         soft_atlas_route_target = soft_atlas_route_target.to(device)
         strain_eng = strain_eng.to(device)
         material_reduced = material_reduced.to(device)
-        teacher_stress_principal = teacher_stress_principal.to(device)
+        teacher_provisional_stress_principal = teacher_provisional_stress_principal.to(device)
+        teacher_projected_stress_principal = teacher_projected_stress_principal.to(device)
+        teacher_projection_delta_principal = teacher_projection_delta_principal.to(device)
         tangent_true = tangent_true.to(device)
 
         if training:
@@ -1821,7 +1920,9 @@ def _epoch_loop(
             xb=xb if _is_soft_atlas_surface_model(model_kind) else None,
             x_scaler=x_scaler if _is_soft_atlas_surface_model(model_kind) else None,
             material_reduced=material_reduced,
-            teacher_stress_principal=teacher_stress_principal,
+            teacher_provisional_stress_principal=teacher_provisional_stress_principal,
+            teacher_projected_stress_principal=teacher_projected_stress_principal,
+            teacher_projection_delta_principal=teacher_projection_delta_principal,
             coordinate_scales=coordinate_scales,
             branch_logits=out.get("branch_logits"),
             stress_weight_alpha=stress_weight_alpha,
@@ -2117,7 +2218,15 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
     train_ds = _build_tensor_dataset(train_arrays, x_scaler, y_scaler)
     val_ds = _build_tensor_dataset(val_arrays, x_scaler, y_scaler)
 
-    if _is_soft_atlas_surface_model(config.model_kind):
+    sample_weights = train_arrays.get("sampling_weight")
+    if sample_weights is not None and np.any(sample_weights > 0.0):
+        sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(sample_weights, dtype=torch.double),
+            num_samples=int(len(train_ds)),
+            replacement=True,
+        )
+        train_loader = DataLoader(train_ds, batch_size=config.batch_size, sampler=sampler, num_workers=config.num_workers)
+    elif _is_soft_atlas_surface_model(config.model_kind):
         sample_weights = _soft_atlas_packet4_sample_weights(
             train_arrays["branch_id"],
             train_arrays.get("hard_mask"),
@@ -2342,7 +2451,7 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
         )
 
         for lbfgs_epoch in range(1, config.lbfgs_epochs + 1):
-            xb, yb, branch, stress_true, stress_principal_true, eigvecs, trial_stress, trial_principal, abr_true_raw, abr_true_nonneg, grho_true, soft_atlas_route_target, strain_eng, material_reduced, teacher_stress_principal, tangent_true = train_full
+            xb, yb, branch, stress_true, stress_principal_true, eigvecs, trial_stress, trial_principal, abr_true_raw, abr_true_nonneg, grho_true, soft_atlas_route_target, strain_eng, material_reduced, teacher_provisional_stress_principal, teacher_projected_stress_principal, teacher_projection_delta_principal, tangent_true = train_full
 
             def closure() -> torch.Tensor:
                 lbfgs.zero_grad(set_to_none=True)
@@ -2365,7 +2474,9 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
                     x_scaler=x_scaler if _is_soft_atlas_surface_model(config.model_kind) else None,
                     soft_route_target=soft_atlas_route_target if _is_soft_atlas_surface_model(config.model_kind) else None,
                     material_reduced=material_reduced,
-                    teacher_stress_principal=teacher_stress_principal,
+                    teacher_provisional_stress_principal=teacher_provisional_stress_principal,
+                    teacher_projected_stress_principal=teacher_projected_stress_principal,
+                    teacher_projection_delta_principal=teacher_projection_delta_principal,
                     coordinate_scales=coordinate_scales,
                     branch_logits=out.get("branch_logits"),
                     stress_weight_alpha=config.stress_weight_alpha,
@@ -2522,8 +2633,9 @@ def load_checkpoint(checkpoint_path: str | Path, device: str = "cpu") -> tuple[n
     return model, metadata
 
 
-def predict_with_checkpoint(
-    checkpoint_path: str | Path,
+def predict_with_loaded_checkpoint(
+    model: nn.Module,
+    metadata: dict[str, Any],
     strain_eng: np.ndarray,
     material_reduced: np.ndarray,
     *,
@@ -2532,8 +2644,7 @@ def predict_with_checkpoint(
     route_temperature: float | None = None,
     branch_override: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
-    """Predict constitutive stresses using a saved checkpoint."""
-    model, metadata = load_checkpoint(checkpoint_path, device=device)
+    """Predict constitutive stresses using an already-loaded checkpoint."""
     device_obj = choose_device(device)
     model = model.to(device_obj)
     cfg = metadata["config"]
@@ -2720,6 +2831,30 @@ def predict_with_checkpoint(
         result["soft_atlas_chart"] = soft_atlas_chart.astype(np.float32)
         result["soft_atlas_route_probs"] = soft_atlas_route_probs.astype(np.float32)
     return result
+
+
+def predict_with_checkpoint(
+    checkpoint_path: str | Path,
+    strain_eng: np.ndarray,
+    material_reduced: np.ndarray,
+    *,
+    device: str = "cpu",
+    batch_size: int | None = None,
+    route_temperature: float | None = None,
+    branch_override: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    """Predict constitutive stresses using a saved checkpoint."""
+    model, metadata = load_checkpoint(checkpoint_path, device=device)
+    return predict_with_loaded_checkpoint(
+        model,
+        metadata,
+        strain_eng,
+        material_reduced,
+        device=device,
+        batch_size=batch_size,
+        route_temperature=route_temperature,
+        branch_override=branch_override,
+    )
 
 
 def evaluate_checkpoint_on_dataset(

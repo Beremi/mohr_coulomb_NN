@@ -1,8 +1,20 @@
+import sys
 from pathlib import Path
 
 import h5py
+import numpy as np
 import pytest
 
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from mc_surrogate.models import (
+    build_trial_principal_geom_features,
+    exact_trial_principal_from_strain,
+    spectral_decomposition_from_strain,
+)
 from mc_surrogate.sampling import DatasetGenerationConfig, generate_branch_balanced_dataset
 from mc_surrogate.training import TrainingConfig, evaluate_checkpoint_on_dataset, train_model
 
@@ -238,3 +250,65 @@ def test_train_projected_student_and_evaluate(tmp_path: Path):
     assert (run_dir / "best.pt").exists()
     assert "principal_mae" in eval_result["metrics"]
     assert "provisional_stress_principal" in eval_result["predictions"]
+
+
+def test_train_projected_student_with_preservation_fields_and_sampling_weight(tmp_path: Path):
+    dataset_path = tmp_path / "train_projected_student_preserve_base.h5"
+    projected_dataset_path = tmp_path / "train_projected_student_preserve.h5"
+    run_dir = tmp_path / "run_projected_student_preserve"
+    generate_branch_balanced_dataset(
+        str(dataset_path),
+        DatasetGenerationConfig(
+            n_samples=96,
+            seed=9,
+            candidate_batch=128,
+            max_abs_principal_strain=2.0e-3,
+        ),
+    )
+
+    with h5py.File(dataset_path, "r") as src, h5py.File(projected_dataset_path, "w") as dst:
+        plastic_mask = src["branch_id"][:] > 0
+        for key in src.keys():
+            value = src[key][:]
+            if value.shape[0] == plastic_mask.shape[0]:
+                value = value[plastic_mask]
+            dst.create_dataset(key, data=value)
+
+        strain_eng = src["strain_eng"][:][plastic_mask]
+        material_reduced = src["material_reduced"][:][plastic_mask]
+        stress_principal = src["stress_principal"][:][plastic_mask]
+        trial_principal = exact_trial_principal_from_strain(strain_eng, material_reduced)
+        strain_principal, _eigvecs = spectral_decomposition_from_strain(strain_eng)
+        geom_features = build_trial_principal_geom_features(strain_principal, material_reduced, trial_principal)
+
+        dst.create_dataset("teacher_provisional_stress_principal", data=stress_principal)
+        dst.create_dataset("teacher_projected_stress_principal", data=stress_principal)
+        dst.create_dataset("teacher_projection_delta_principal", data=np.zeros_like(stress_principal, dtype=np.float32))
+        dst.create_dataset("teacher_projection_candidate_id", data=np.zeros(stress_principal.shape[0], dtype=np.int8))
+        dst.create_dataset("teacher_projection_disp_norm", data=np.zeros(stress_principal.shape[0], dtype=np.float32))
+        dst.create_dataset("ds_valid_mask", data=np.ones(stress_principal.shape[0], dtype=np.int8))
+        dst.create_dataset("sampling_weight", data=np.linspace(1.0, 2.0, stress_principal.shape[0], dtype=np.float32))
+        dst.create_dataset("trial_principal_geom_feature_f1", data=geom_features.astype(np.float32))
+        for key, value in src.attrs.items():
+            dst.attrs[key] = value
+
+    config = TrainingConfig(
+        dataset=str(projected_dataset_path),
+        run_dir=str(run_dir),
+        model_kind="trial_principal_geom_projected_student",
+        epochs=2,
+        batch_size=16,
+        lr=1.0e-3,
+        width=32,
+        depth=1,
+        seed=9,
+        patience=5,
+        device="cpu",
+        scheduler_kind="plateau",
+        regression_loss_kind="huber",
+    )
+    summary = train_model(config)
+    eval_result = evaluate_checkpoint_on_dataset(summary["best_checkpoint"], projected_dataset_path, split="test", device="cpu")
+
+    assert (run_dir / "best.pt").exists()
+    assert "principal_mae" in eval_result["metrics"]
