@@ -24,21 +24,23 @@ The target is a pointwise constitutive map, not a global PDE operator. That is t
 Read these in order when you are new to the repo:
 
 1. [README.md](../README.md)
-2. [mohr_coulomb.md](mohr_coulomb.md)
-3. [dataset_creation.md](dataset_creation.md)
-4. [full_export_inspection.md](full_export_inspection.md)
-5. [report.md](../report.md)
-6. [report2.md](../report2.md)
-7. [real_sim_experiment_log.md](real_sim_experiment_log.md)
-8. [cover_layer_branch_predictor_status_for_expert_20260316.md](cover_layer_branch_predictor_status_for_expert_20260316.md)
-9. [next_workplan_from_report.md](next_workplan_from_report.md)
+2. [progress.md](../progress.md)
+3. [repository_general_report_20260326.md](repository_general_report_20260326.md)
+4. [repository_general_report_metric_dictionary_20260326.md](repository_general_report_metric_dictionary_20260326.md)
+5. [cover_layer_comprehensive_report_20260326.md](cover_layer_comprehensive_report_20260326.md)
+6. [repository_general_report_appendix_20260326.md](repository_general_report_appendix_20260326.md)
+7. [mohr_coulomb.md](mohr_coulomb.md)
+8. [dataset_creation.md](dataset_creation.md)
+9. [full_export_inspection.md](full_export_inspection.md)
+10. [report.md](../report.md)
 
 If you only need the shortest orientation path, read:
 
-- [README.md](../README.md)
-- [full_export_inspection.md](full_export_inspection.md)
-- [real_sim_experiment_log.md](real_sim_experiment_log.md)
-- [cover_layer_branch_predictor_status_for_expert_20260316.md](cover_layer_branch_predictor_status_for_expert_20260316.md)
+- [progress.md](../progress.md)
+- [repository_general_report_20260326.md](repository_general_report_20260326.md)
+- [repository_general_report_metric_dictionary_20260326.md](repository_general_report_metric_dictionary_20260326.md)
+- [cover_layer_comprehensive_report_20260326.md](cover_layer_comprehensive_report_20260326.md)
+- [repository_general_report_appendix_20260326.md](repository_general_report_appendix_20260326.md)
 
 ## Repo Map
 
@@ -74,9 +76,14 @@ If you only need the shortest orientation path, read:
 
 ### Reports and theory
 
-- [`docs/`](.): theory notes, experiment logs, status reports, and generated model cards
-- [`report.md`](../report.md): literature review and state-of-the-art framing
-- [`report2.md`](../report2.md): tactical decision memo about what should happen next
+- [`docs/`](.): theory notes, experiment logs, retained prehistory, and the canonical closeout set
+- [`docs/repository_general_report_20260326.md`](repository_general_report_20260326.md): current repository-wide decision report
+- [`docs/repository_general_report_metric_dictionary_20260326.md`](repository_general_report_metric_dictionary_20260326.md): canonical metric glossary and alias map
+- [`docs/cover_layer_comprehensive_report_20260326.md`](cover_layer_comprehensive_report_20260326.md): dedicated closeout for the local cover-layer line and its generator / routing prehistory
+- [`docs/repository_general_report_appendix_20260326.md`](repository_general_report_appendix_20260326.md): retained-docs catalog for the current `docs/**/*.md` library
+- [`docs/tasks/projection_student_work_packet_20260326.md`](tasks/projection_student_work_packet_20260326.md): normalized task memo for the live projection-student packet
+- [`docs/executions/projection_student_work_packet_20260326.md`](executions/projection_student_work_packet_20260326.md): standalone execution report for the same packet
+- [`report.md`](../report.md): literature review and state-of-the-art framing retained as background
 
 ### Tests
 

@@ -99,7 +99,7 @@ def dataset_summary(path: str | Path) -> dict[str, Any]:
         summary = {
             "path": str(path),
             "n_samples": int(f["strain_eng"].shape[0]),
-            "contains_tangent": "tangent" in f,
+            "contains_tangent": "tangent" in f or "DS" in f,
             "branch_names": json.loads(f.attrs["branch_names_json"]),
             "raw_material_columns": json.loads(f.attrs["raw_material_columns_json"]),
             "reduced_material_columns": json.loads(f.attrs["reduced_material_columns_json"]),

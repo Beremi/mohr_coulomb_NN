@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import h5py
+import pytest
 
 from mc_surrogate.sampling import DatasetGenerationConfig, generate_branch_balanced_dataset
 from mc_surrogate.training import TrainingConfig, evaluate_checkpoint_on_dataset, train_model
@@ -147,3 +148,93 @@ def test_train_trial_raw_branch_residual_and_evaluate(tmp_path: Path):
     eval_result = evaluate_checkpoint_on_dataset(summary["best_checkpoint"], dataset_path, split="test", device="cpu")
     assert (run_dir / "best.pt").exists()
     assert "stress_mae" in eval_result["metrics"]
+
+
+def test_evaluate_checkpoint_accepts_route_temperature_for_non_soft_atlas_model(tmp_path: Path):
+    dataset_path = tmp_path / "train_principal_temp_eval.h5"
+    run_dir = tmp_path / "run_principal_temp_eval"
+    generate_branch_balanced_dataset(
+        str(dataset_path),
+        DatasetGenerationConfig(
+            n_samples=40,
+            seed=7,
+            candidate_batch=128,
+            max_abs_principal_strain=2.0e-3,
+        ),
+    )
+
+    config = TrainingConfig(
+        dataset=str(dataset_path),
+        run_dir=str(run_dir),
+        model_kind="principal",
+        epochs=2,
+        batch_size=16,
+        lr=1.0e-3,
+        width=32,
+        depth=1,
+        seed=7,
+        patience=5,
+        device="cpu",
+        scheduler_kind="cosine",
+        warmup_epochs=1,
+        min_lr=1.0e-5,
+    )
+    summary = train_model(config)
+    eval_default = evaluate_checkpoint_on_dataset(summary["best_checkpoint"], dataset_path, split="test", device="cpu")
+    eval_temp = evaluate_checkpoint_on_dataset(
+        summary["best_checkpoint"],
+        dataset_path,
+        split="test",
+        device="cpu",
+        route_temperature=0.60,
+    )
+
+    assert eval_default["metrics"]["stress_mae"] == pytest.approx(eval_temp["metrics"]["stress_mae"])
+
+
+def test_train_projected_student_and_evaluate(tmp_path: Path):
+    dataset_path = tmp_path / "train_projected_student_base.h5"
+    projected_dataset_path = tmp_path / "train_projected_student.h5"
+    run_dir = tmp_path / "run_projected_student"
+    generate_branch_balanced_dataset(
+        str(dataset_path),
+        DatasetGenerationConfig(
+            n_samples=80,
+            seed=8,
+            candidate_batch=128,
+            max_abs_principal_strain=2.0e-3,
+        ),
+    )
+
+    with h5py.File(dataset_path, "r") as src, h5py.File(projected_dataset_path, "w") as dst:
+        plastic_mask = src["branch_id"][:] > 0
+        for key in src.keys():
+            value = src[key][:]
+            if value.shape[0] == plastic_mask.shape[0]:
+                value = value[plastic_mask]
+            dst.create_dataset(key, data=value)
+        dst.create_dataset("teacher_stress_principal", data=src["stress_principal"][:][plastic_mask])
+        for key, value in src.attrs.items():
+            dst.attrs[key] = value
+
+    config = TrainingConfig(
+        dataset=str(projected_dataset_path),
+        run_dir=str(run_dir),
+        model_kind="trial_principal_geom_projected_student",
+        epochs=2,
+        batch_size=16,
+        lr=1.0e-3,
+        width=32,
+        depth=1,
+        seed=8,
+        patience=5,
+        device="cpu",
+        scheduler_kind="plateau",
+        regression_loss_kind="huber",
+    )
+    summary = train_model(config)
+    eval_result = evaluate_checkpoint_on_dataset(summary["best_checkpoint"], projected_dataset_path, split="test", device="cpu")
+
+    assert (run_dir / "best.pt").exists()
+    assert "principal_mae" in eval_result["metrics"]
+    assert "provisional_stress_principal" in eval_result["predictions"]

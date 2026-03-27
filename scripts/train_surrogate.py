@@ -23,6 +23,8 @@ def parse_args() -> argparse.Namespace:
             "trial_raw_branch",
             "trial_raw_residual",
             "trial_raw_branch_residual",
+            "trial_principal_branch_residual",
+            "trial_principal_geom_plastic_branch_residual",
         ),
         default="principal",
     )
@@ -51,6 +53,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every-epochs", type=int, default=0)
     parser.add_argument("--stress-weight-alpha", type=float, default=0.0)
     parser.add_argument("--stress-weight-scale", type=float, default=250.0)
+    parser.add_argument("--init-checkpoint", default=None)
+    parser.add_argument("--regression-loss-kind", choices=("mse", "huber"), default="mse")
+    parser.add_argument("--huber-delta", type=float, default=1.0)
+    parser.add_argument("--voigt-mae-weight", type=float, default=0.0)
+    parser.add_argument("--snapshot-every-epochs", type=int, default=0)
+    parser.add_argument("--tangent-loss-weight", type=float, default=0.0)
+    parser.add_argument("--tangent-fd-scale", type=float, default=1.0e-6)
     return parser.parse_args()
 
 
@@ -85,6 +94,13 @@ def main() -> None:
         log_every_epochs=args.log_every_epochs,
         stress_weight_alpha=args.stress_weight_alpha,
         stress_weight_scale=args.stress_weight_scale,
+        init_checkpoint=args.init_checkpoint,
+        regression_loss_kind=args.regression_loss_kind,
+        huber_delta=args.huber_delta,
+        voigt_mae_weight=args.voigt_mae_weight,
+        snapshot_every_epochs=args.snapshot_every_epochs,
+        tangent_loss_weight=args.tangent_loss_weight,
+        tangent_fd_scale=args.tangent_fd_scale,
     )
     summary = train_model(config)
     print(json.dumps(summary, indent=2))

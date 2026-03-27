@@ -383,6 +383,170 @@ def sample_cover_family_dataset(
     return output_path, summary
 
 
+def sample_full_export_dataset(
+    path: str | Path,
+    output_path: str | Path,
+    *,
+    samples_per_call: int = 512,
+    split_fractions: tuple[float, float, float] = (0.70, 0.15, 0.15),
+    seed: int = 0,
+    use_exact_stress: bool = True,
+    include_tangent: bool = True,
+) -> tuple[Path, dict[str, Any]]:
+    """
+    Build a mixed-material sampled dataset from the full export with call-level splits.
+
+    The full export is the source of truth, but this helper keeps the derived
+    dataset trainable by sampling a fixed number of integration-point rows per
+    constitutive call.
+    """
+    path = Path(path)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(seed)
+
+    with h5py.File(path, "r") as f:
+        call_names = list(f["calls"].keys())
+
+    perm_calls = rng.permutation(len(call_names))
+    n_train = int(round(split_fractions[0] * len(call_names)))
+    n_val = int(round(split_fractions[1] * len(call_names)))
+    train_calls = perm_calls[:n_train]
+    val_calls = perm_calls[n_train : n_train + n_val]
+    test_calls = perm_calls[n_train + n_val :]
+
+    call_to_split = np.full(len(call_names), SPLIT_TO_ID["test"], dtype=np.int8)
+    call_to_split[train_calls] = SPLIT_TO_ID["train"]
+    call_to_split[val_calls] = SPLIT_TO_ID["val"]
+    call_to_split[test_calls] = SPLIT_TO_ID["test"]
+
+    strain_parts: list[np.ndarray] = []
+    stress_parts: list[np.ndarray] = []
+    material_parts: list[np.ndarray] = []
+    stress_principal_parts: list[np.ndarray] = []
+    branch_parts: list[np.ndarray] = []
+    eigvec_parts: list[np.ndarray] = []
+    tangent_parts: list[np.ndarray] = []
+    split_parts: list[np.ndarray] = []
+    call_id_parts: list[np.ndarray] = []
+    row_in_call_parts: list[np.ndarray] = []
+
+    exact_abs_sum = 0.0
+    exact_sq_sum = 0.0
+    exact_count = 0
+    exact_max = 0.0
+
+    with h5py.File(path, "r") as f:
+        calls = f["calls"]
+        for call_idx, call_name in enumerate(call_names):
+            grp = calls[call_name]
+            n_rows = grp["E"].shape[0]
+            k = min(samples_per_call, n_rows)
+            sample_rows = np.sort(rng.choice(n_rows, size=k, replace=False))
+            strain = grp["E"][sample_rows].astype(np.float32)
+            stress_export = grp["S"][sample_rows].astype(np.float32)
+            material = _read_material_rows(grp)[sample_rows]
+            tangent = None
+            ds_available = False
+            if include_tangent and "DS" in grp:
+                ds_shape = grp["DS"].shape
+                ds_available = ds_shape is not None and len(ds_shape) > 0 and ds_shape[0] > 0
+            if ds_available:
+                tangent = grp["DS"][sample_rows].astype(np.float32).reshape(-1, 6, 6)
+
+            exact = constitutive_update_3d(
+                strain,
+                c_bar=material[:, 0],
+                sin_phi=material[:, 1],
+                shear=material[:, 2],
+                bulk=material[:, 3],
+                lame=material[:, 4],
+            )
+            exact_stress = exact.stress.astype(np.float32)
+            diff = exact_stress - stress_export
+            exact_abs_sum += float(np.abs(diff).sum())
+            exact_sq_sum += float(np.square(diff).sum())
+            exact_count += int(diff.size)
+            exact_max = max(exact_max, float(np.abs(diff).max()))
+
+            strain_parts.append(strain)
+            stress_parts.append(exact_stress if use_exact_stress else stress_export)
+            material_parts.append(material.astype(np.float32))
+            stress_principal_parts.append(exact.stress_principal.astype(np.float32))
+            branch_parts.append(exact.branch_id.astype(np.int8))
+            eigvec_parts.append(exact.eigvecs.astype(np.float32))
+            split_parts.append(np.full(k, call_to_split[call_idx], dtype=np.int8))
+            call_id_parts.append(np.full(k, call_idx, dtype=np.int32))
+            row_in_call_parts.append(sample_rows.astype(np.int32))
+            if include_tangent:
+                if tangent is None:
+                    tangent_parts.append(np.full((k, 6, 6), np.nan, dtype=np.float32))
+                else:
+                    tangent_parts.append(tangent)
+
+    arrays = {
+        "strain_eng": np.vstack(strain_parts),
+        "stress": np.vstack(stress_parts),
+        "material_reduced": np.vstack(material_parts),
+        "stress_principal": np.vstack(stress_principal_parts),
+        "branch_id": np.concatenate(branch_parts),
+        "eigvecs": np.vstack(eigvec_parts),
+        "split_id": np.concatenate(split_parts),
+        "source_call_id": np.concatenate(call_id_parts),
+        "source_row_in_call": np.concatenate(row_in_call_parts),
+    }
+    if tangent_parts:
+        arrays["tangent"] = np.vstack(tangent_parts)
+
+    attrs = {
+        "source_hdf5": str(path),
+        "samples_per_call": samples_per_call,
+        "use_exact_stress": bool(use_exact_stress),
+        "include_tangent": bool(include_tangent),
+        "split_seed": int(seed),
+        "source_call_names_json": json.dumps(call_names),
+        "train_call_names_json": json.dumps([call_names[i] for i in train_calls]),
+        "val_call_names_json": json.dumps([call_names[i] for i in val_calls]),
+        "test_call_names_json": json.dumps([call_names[i] for i in test_calls]),
+        "exact_match_mae": exact_abs_sum / max(exact_count, 1),
+        "exact_match_rmse": float(np.sqrt(exact_sq_sum / max(exact_count, 1))),
+        "exact_match_max_abs": exact_max,
+        "branch_names_json": json.dumps(BRANCH_NAMES),
+        "raw_material_columns_json": json.dumps(RAW_MATERIAL_COLUMNS),
+        "reduced_material_columns_json": json.dumps(REDUCED_MATERIAL_COLUMNS),
+        "split_names_json": json.dumps(SPLIT_NAMES),
+    }
+
+    with h5py.File(output_path, "w") as f:
+        for key, value in arrays.items():
+            f.create_dataset(key, data=np.asarray(value), compression="gzip", shuffle=True)
+        if "tangent" in arrays:
+            f.create_dataset("DS", data=np.asarray(arrays["tangent"]), compression="gzip", shuffle=True)
+        for key, value in attrs.items():
+            if isinstance(value, (dict, list, tuple)):
+                f.attrs[key] = json.dumps(_json_safe(value))
+            else:
+                f.attrs[key] = value
+
+    summary = {
+        "output_path": str(output_path),
+        "n_samples": int(arrays["strain_eng"].shape[0]),
+        "split_counts": {
+            name: int(np.sum(arrays["split_id"] == SPLIT_TO_ID[name]))
+            for name in SPLIT_NAMES
+        },
+        "branch_counts": {
+            BRANCH_NAMES[i]: int(np.sum(arrays["branch_id"] == i))
+            for i in range(len(BRANCH_NAMES))
+        },
+        "exact_match_mae": attrs["exact_match_mae"],
+        "exact_match_rmse": attrs["exact_match_rmse"],
+        "exact_match_max_abs": attrs["exact_match_max_abs"],
+        "contains_tangent": "tangent" in arrays,
+    }
+    return output_path, summary
+
+
 def load_cover_call_archive(
     path: str | Path,
     *,
