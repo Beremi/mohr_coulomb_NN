@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+
 import numpy as np
 
 from .models import (
@@ -13,6 +15,30 @@ from .models import (
 from .mohr_coulomb import BRANCH_NAMES
 from .principal_projection import PROJECTION_CANDIDATE_NAMES, PROJECTION_CANDIDATE_TO_ID, project_mc_principal_numpy
 from .voigt import stress_voigt_to_tensor
+
+BOUNDARY_MASK_KEYS = (
+    "near_yield_mask",
+    "near_smooth_left_mask",
+    "near_smooth_right_mask",
+    "near_left_apex_mask",
+    "near_right_apex_mask",
+)
+
+
+def build_any_boundary_mask(arrays: Mapping[str, np.ndarray]) -> np.ndarray:
+    n_rows = None
+    any_boundary = None
+    for key in BOUNDARY_MASK_KEYS:
+        if key not in arrays:
+            continue
+        mask = np.asarray(arrays[key], dtype=bool).reshape(-1)
+        if n_rows is None:
+            n_rows = mask.shape[0]
+            any_boundary = np.zeros(n_rows, dtype=bool)
+        any_boundary |= mask
+    if any_boundary is None:
+        return np.zeros(0, dtype=bool)
+    return any_boundary
 
 
 def quantile_or_zero(values: np.ndarray, q: float) -> float:
@@ -83,28 +109,283 @@ def build_sampling_weights(
     hard_mask: np.ndarray,
     teacher_projection_candidate_id: np.ndarray,
     teacher_projection_disp_norm: np.ndarray,
+    any_boundary_mask: np.ndarray | None = None,
+    branch_id: np.ndarray | None = None,
+    hard_multiplier: float = 1.5,
+    edge_candidate_multiplier: float = 1.5,
+    high_disp_multiplier: float = 1.5,
+    boundary_multiplier: float = 1.0,
+    candidate_weight_map: Mapping[int, float] | None = None,
+    branch_weight_map: Mapping[int, float] | None = None,
+    high_disp_quantile: float = 0.90,
+    high_disp_threshold: float | None = None,
 ) -> tuple[np.ndarray, float]:
     train = np.asarray(train_mask, dtype=bool).reshape(-1)
     hard = np.asarray(hard_mask, dtype=bool).reshape(-1)
     candidate_id = np.asarray(teacher_projection_candidate_id, dtype=np.int64).reshape(-1)
     disp = np.asarray(teacher_projection_disp_norm, dtype=float).reshape(-1)
+    any_boundary = (
+        np.asarray(any_boundary_mask, dtype=bool).reshape(-1)
+        if any_boundary_mask is not None
+        else np.zeros(candidate_id.shape[0], dtype=bool)
+    )
+    branch = (
+        np.asarray(branch_id, dtype=np.int64).reshape(-1)
+        if branch_id is not None
+        else np.full(candidate_id.shape[0], -1, dtype=np.int64)
+    )
 
     train_disp = disp[train & np.isfinite(disp)]
-    disp_threshold = quantile_or_zero(train_disp, 0.90)
+    disp_threshold = float(high_disp_threshold) if high_disp_threshold is not None else quantile_or_zero(train_disp, high_disp_quantile)
 
     weights = np.ones(candidate_id.shape[0], dtype=np.float32)
-    edge_mask = np.isin(
-        candidate_id,
-        [
-            PROJECTION_CANDIDATE_TO_ID["left_edge"],
-            PROJECTION_CANDIDATE_TO_ID["right_edge"],
-        ],
-    )
     high_disp_mask = np.isfinite(disp) & (disp >= disp_threshold)
-    weights[hard] *= 1.5
-    weights[edge_mask] *= 1.5
-    weights[high_disp_mask] *= 1.5
+    if hard_multiplier != 1.0:
+        weights[hard] *= float(hard_multiplier)
+    if boundary_multiplier != 1.0:
+        weights[any_boundary] *= float(boundary_multiplier)
+    if candidate_weight_map is not None:
+        for bucket_id, multiplier in candidate_weight_map.items():
+            if float(multiplier) != 1.0:
+                weights[candidate_id == int(bucket_id)] *= float(multiplier)
+    elif edge_candidate_multiplier != 1.0:
+        edge_mask = np.isin(
+            candidate_id,
+            [
+                PROJECTION_CANDIDATE_TO_ID["left_edge"],
+                PROJECTION_CANDIDATE_TO_ID["right_edge"],
+            ],
+        )
+        weights[edge_mask] *= float(edge_candidate_multiplier)
+    if branch_weight_map is not None:
+        for bucket_id, multiplier in branch_weight_map.items():
+            if float(multiplier) != 1.0:
+                weights[branch == int(bucket_id)] *= float(multiplier)
+    if high_disp_multiplier != 1.0:
+        weights[high_disp_mask] *= float(high_disp_multiplier)
     return weights.astype(np.float32), float(disp_threshold)
+
+
+def principal_abs_error_arrays(
+    pred_principal: np.ndarray,
+    true_principal: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    pred = np.asarray(pred_principal, dtype=np.float32)
+    true = np.asarray(true_principal, dtype=np.float32)
+    abs_error = np.abs(pred - true).astype(np.float32)
+    max_abs_error = np.max(abs_error, axis=1).astype(np.float32)
+    return abs_error, max_abs_error
+
+
+def displacement_decile_edges(
+    values: np.ndarray,
+    *,
+    reference_mask: np.ndarray | None = None,
+    n_bins: int = 10,
+) -> np.ndarray:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    if reference_mask is not None:
+        ref = arr[np.asarray(reference_mask, dtype=bool).reshape(-1)]
+    else:
+        ref = arr
+    ref = ref[np.isfinite(ref)]
+    if ref.size == 0:
+        return np.linspace(0.0, 1.0, n_bins + 1, dtype=np.float64)
+    quantiles = np.linspace(0.0, 1.0, n_bins + 1, dtype=np.float64)
+    edges = np.quantile(ref, quantiles).astype(np.float64)
+    edges[0] = -np.inf
+    edges[-1] = np.inf
+    for idx in range(1, edges.shape[0] - 1):
+        prev = edges[idx - 1]
+        if edges[idx] <= prev:
+            edges[idx] = np.nextafter(prev, np.inf)
+    return edges
+
+
+def assign_quantile_bins(
+    values: np.ndarray,
+    edges: np.ndarray,
+) -> np.ndarray:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    finite_fill = np.nanmin(edges[np.isfinite(edges)]) if np.any(np.isfinite(edges)) else 0.0
+    safe = np.where(np.isfinite(arr), arr, finite_fill)
+    bins = np.digitize(safe, edges[1:-1], right=True)
+    return np.clip(bins.astype(np.int8), 0, max(edges.shape[0] - 2, 0))
+
+
+def build_top_fraction_mask(
+    values: np.ndarray,
+    *,
+    pool_mask: np.ndarray,
+    fraction: float,
+) -> tuple[np.ndarray, float]:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    pool = np.asarray(pool_mask, dtype=bool).reshape(-1)
+    out = np.zeros(arr.shape[0], dtype=bool)
+    pool_values = arr[pool & np.isfinite(arr)]
+    if pool_values.size == 0:
+        return out, float("nan")
+    threshold = float(np.quantile(pool_values, max(0.0, 1.0 - float(fraction))))
+    out = pool & np.isfinite(arr) & (arr >= threshold)
+    return out, threshold
+
+
+def build_control_zero_rowwise_arrays(
+    split_arrays: Mapping[str, np.ndarray],
+    control_predictions: Mapping[str, np.ndarray],
+    *,
+    disp_decile_edges: np.ndarray | None = None,
+) -> tuple[dict[str, np.ndarray], dict[str, float | list[float]]]:
+    exact = np.asarray(split_arrays["exact_stress_principal"], dtype=np.float32)
+    control = np.asarray(control_predictions["stress_principal"], dtype=np.float32)
+    control_abs_error, control_max_abs_error = principal_abs_error_arrays(control, exact)
+    any_boundary_mask = build_any_boundary_mask(split_arrays)
+    disp_norm = np.asarray(split_arrays["teacher_projection_disp_norm"], dtype=np.float32)
+    if disp_decile_edges is None:
+        disp_decile_edges = displacement_decile_edges(
+            disp_norm,
+            reference_mask=np.asarray(split_arrays["plastic_mask"], dtype=bool),
+            n_bins=10,
+        )
+    disp_decile = assign_quantile_bins(disp_norm, disp_decile_edges)
+    provisional = control_predictions.get("provisional_stress_principal")
+    predicted_branch = control_predictions.get("predicted_branch_id")
+    if provisional is None:
+        provisional = np.full_like(control, np.nan, dtype=np.float32)
+    else:
+        provisional = np.asarray(provisional, dtype=np.float32)
+    if predicted_branch is None:
+        predicted_branch = np.full(control.shape[0], -1, dtype=np.int64)
+    else:
+        predicted_branch = np.asarray(predicted_branch, dtype=np.int64).reshape(-1)
+
+    rowwise = {
+        "split_id": np.asarray(split_arrays["split_id"], dtype=np.int8),
+        "source_call_id": np.asarray(split_arrays["source_call_id"], dtype=np.int32),
+        "source_row_in_call": np.asarray(split_arrays["source_row_in_call"], dtype=np.int32),
+        "branch_id": np.asarray(split_arrays["branch_id"], dtype=np.int8),
+        "hard_mask": np.asarray(split_arrays["hard_mask"], dtype=np.int8),
+        "plastic_mask": np.asarray(split_arrays["plastic_mask"], dtype=np.int8),
+        "ds_valid_mask": np.asarray(split_arrays["ds_valid_mask"], dtype=np.int8),
+        "teacher_projection_candidate_id": np.asarray(split_arrays["teacher_projection_candidate_id"], dtype=np.int8),
+        "teacher_projection_disp_norm": disp_norm.astype(np.float32),
+        "teacher_projection_disp_decile": disp_decile.astype(np.int8),
+        "any_boundary_mask": any_boundary_mask.astype(np.int8),
+        "exact_stress_principal": exact.astype(np.float32),
+        "teacher_projected_stress_principal": np.asarray(split_arrays["teacher_projected_stress_principal"], dtype=np.float32),
+        "control_zero_projected_stress_principal": control.astype(np.float32),
+        "control_zero_provisional_stress_principal": provisional.astype(np.float32),
+        "control_zero_predicted_branch_id": predicted_branch.astype(np.int64),
+        "control_zero_principal_abs_error": control_abs_error.astype(np.float32),
+        "control_zero_principal_max_abs_error": control_max_abs_error.astype(np.float32),
+    }
+    for key in BOUNDARY_MASK_KEYS:
+        rowwise[key] = np.asarray(split_arrays.get(key, np.zeros(control.shape[0], dtype=np.int8)), dtype=np.int8)
+    meta = {
+        "teacher_projection_disp_decile_edges": [float(x) for x in np.asarray(disp_decile_edges, dtype=float)],
+    }
+    return rowwise, meta
+
+
+def build_slice_summary_rows(
+    *,
+    scope_name: str,
+    rowwise_arrays: Mapping[str, np.ndarray],
+    group_name: str,
+    group_values: np.ndarray,
+    labels: Mapping[int, str] | Sequence[str],
+    base_mask: np.ndarray,
+    hard_top_fraction_masks: Mapping[str, np.ndarray],
+    error_key: str = "control_zero_principal_max_abs_error",
+) -> list[dict[str, float | int | str]]:
+    values = np.asarray(group_values)
+    base = np.asarray(base_mask, dtype=bool).reshape(-1)
+    hard = np.asarray(rowwise_arrays["hard_mask"], dtype=bool).reshape(-1)
+    max_abs = np.asarray(rowwise_arrays[error_key], dtype=float).reshape(-1)
+    hard_base = base & hard
+    hard_base_count = int(np.sum(hard_base))
+
+    if isinstance(labels, Mapping):
+        label_map = {int(key): str(value) for key, value in labels.items()}
+    else:
+        label_map = {idx: str(value) for idx, value in enumerate(labels)}
+
+    rows: list[dict[str, float | int | str]] = []
+    for bucket_id, bucket_label in label_map.items():
+        mask = base & (values == bucket_id)
+        if not np.any(mask):
+            continue
+        hard_count = int(np.sum(mask & hard))
+        row = {
+            "scope": scope_name,
+            "group_name": group_name,
+            "group_value": bucket_label,
+            "group_id": int(bucket_id),
+            "n_rows": int(np.sum(mask)),
+            "n_hard_rows": hard_count,
+            "hard_base_share": float(hard_count / max(hard_base_count, 1)),
+            "mean_principal_max_abs_error": float(np.mean(max_abs[mask])),
+            "p95_principal_max_abs_error": quantile_or_zero(max_abs[mask], 0.95),
+            "p99_principal_max_abs_error": quantile_or_zero(max_abs[mask], 0.99),
+        }
+        for suffix, top_mask in hard_top_fraction_masks.items():
+            denom = int(np.sum(top_mask))
+            numer = int(np.sum(mask & top_mask))
+            row[f"hard_top{suffix}_count"] = numer
+            row[f"hard_top{suffix}_share"] = float(numer / max(denom, 1))
+            base_share = float(hard_count / max(hard_base_count, 1))
+            row[f"hard_top{suffix}_over_index"] = float((numer / max(denom, 1)) / max(base_share, 1.0e-12))
+        rows.append(row)
+    return rows
+
+
+def build_call_concentration_rows(
+    *,
+    scope_name: str,
+    source_call_id: np.ndarray,
+    base_mask: np.ndarray,
+    hard_mask: np.ndarray,
+    principal_max_abs_error: np.ndarray,
+    hard_top_mask: np.ndarray,
+    top_n: int = 20,
+) -> list[dict[str, float | int | str]]:
+    call_id = np.asarray(source_call_id, dtype=np.int64).reshape(-1)
+    base = np.asarray(base_mask, dtype=bool).reshape(-1)
+    hard = np.asarray(hard_mask, dtype=bool).reshape(-1)
+    error = np.asarray(principal_max_abs_error, dtype=float).reshape(-1)
+    top_mask = np.asarray(hard_top_mask, dtype=bool).reshape(-1)
+    valid = base & (call_id >= 0)
+    if not np.any(valid):
+        return []
+    total_top = int(np.sum(top_mask & valid))
+    rows: list[dict[str, float | int | str]] = []
+    for bucket in np.unique(call_id[valid]):
+        call_mask = valid & (call_id == bucket)
+        hard_rows = call_mask & hard
+        if not np.any(hard_rows):
+            continue
+        top_rows = call_mask & top_mask
+        rows.append(
+            {
+                "scope": scope_name,
+                "source_call_id": int(bucket),
+                "n_rows": int(np.sum(call_mask)),
+                "n_hard_rows": int(np.sum(hard_rows)),
+                "hard_top5_count": int(np.sum(top_rows)),
+                "hard_top5_share": float(np.sum(top_rows) / max(total_top, 1)),
+                "mean_principal_max_abs_error": float(np.mean(error[call_mask])),
+                "p95_principal_max_abs_error": quantile_or_zero(error[call_mask], 0.95),
+                "p99_principal_max_abs_error": quantile_or_zero(error[call_mask], 0.99),
+            }
+        )
+    rows.sort(
+        key=lambda row: (
+            -float(row["hard_top5_share"]),
+            -int(row["hard_top5_count"]),
+            -float(row["p95_principal_max_abs_error"]),
+        )
+    )
+    return rows[:top_n]
 
 
 def build_teacher_projection_cache_arrays(

@@ -17,10 +17,10 @@ Read this first.
 - Date: `2026-03-27`
 - Canonical closeout for the absorbed historical report stack: `docs/repository_general_report_20260326.md`
 - Canonical closeout for the local cover-layer prehistory: `docs/cover_layer_comprehensive_report_20260326.md`
-- Last executed program: `projection-student preservation/compression packet`
+- Last executed program: `projection-student hard-tail closure packet`
 - Current program state: `continue_projection_student`
-- Reason: the exact projected teacher remains solver-credible on forward stress, the March 27 same-capacity preservation control materially beat the March 26 `medium_exact` student on validation, but the preserved student still missed the Tier 1 `hard_p95 <= 180` gate, so the route stays alive only in a narrowed preservation-first mode and compression remains closed
-- `DS` status: still blocked; the projected-teacher probe was mixed and the preserved student remains well above the reopen bar
+- Reason: the same-capacity March 27 hard-tail closure winner `combined_focus` cleared the explicit `<= 18 / <= 20 / <= 180 / <= 1e-6` gate at validation `16.687582 / 18.913580 / 176.145065 / 2.310791e-08`, but both cold-start near-same-capacity follow-ons regressed badly, so the route stays alive only in the same-capacity projection-student preservation family while compression remains closed under the stricter reopen bar
+- `DS` status: still blocked; the projected-teacher probe remained mixed and the new best student is still far above the `DS` reopen bar
 
 ## Projection-Student Outcome
 
@@ -124,6 +124,50 @@ Current decision after the March 27 preservation/compression packet:
 - keep `DS` blocked
 - do not open Tier 1 / Tier 2 compression yet
 - focus any immediate follow-on on closing the remaining hard-tail (`p95`) gap to the projected teacher before reopening compression or broader tangent work
+
+## Projection-Student Hard-Tail Closure Outcome
+
+The March 27 follow-on brief narrowed the live route again, from preservation/compression to hard-tail closure inside the same projected-student family.
+
+Implemented artifacts live under:
+
+- `experiment_runs/real_sim/projection_student_hard_tail_closure_20260327/`
+- `docs/tasks/projection_student_hard_tail_closure_work_packet_20260327.md`
+- `docs/executions/projection_student_hard_tail_closure_work_packet_20260327.md`
+
+Phase A control-zero localization:
+
+- frozen control-zero checkpoint stayed the March 27 `256x4` preservation control at `16.891312 / 19.413279 / 196.215149 / 2.329866e-08` on validation
+- rowwise control-zero H5s were built for validation and test with split ids, source call ids, branch ids, hard / `ds_valid` / `near_*` masks, teacher candidate ids, displacement norms, exact stress, projected-teacher stress, control-zero stress, and rowwise principal errors
+- validation hard-tail localization showed `any_boundary_mask` carrying `536 / 1060 = 50.57%` of hard-top5 rows, which was enough to trigger evidence-backed boundary focus
+- the top displacement decile was strong but below the explicit trigger: `377 / 1060 = 35.57%` of validation hard-top5 rows on `11.03%` hard-base share, so high-displacement-only focus stayed off
+- no dominant branch or candidate slice passed the packet trigger; `right_edge` and `left_edge` branches were both large contributors, but neither cleared the `>= 45%` plus `>= 1.75x` rule
+- the sharpest boundary slices were apex-adjacent, not near-yield; near-yield contributed effectively none of the hard tail
+- call concentration stayed diffuse enough that call-specific weighting was not justified
+
+Phase B/C same-capacity sweep:
+
+- preservation dataset rebuilt at `experiment_runs/real_sim/projection_student_hard_tail_closure_20260327/exp1_tail_closure_controls/base_preservation_dataset.h5` with carried-forward `near_*` masks plus `any_boundary_mask`
+- `weighted_focus` regressed badly to validation `24.283125 / 26.305031 / 224.304886 / 1.965997e-08`
+- `tail_loss_focus` materially improved to validation `16.417603 / 18.928406 / 186.317963 / 2.339881e-08`
+- `combined_focus` won the packet at validation `16.687582 / 18.913580 / 176.145065 / 2.310791e-08` and test `17.594461 / 19.734207 / 183.963257 / 2.290212e-08`
+- the explicit same-capacity gate `<= 18 / <= 20 / <= 180 / <= 1e-6` became `True`
+- the improvement came from combining evidence-backed boundary focus with hard-row quantile tail loss and stronger teacher / delta alignment, not from sampling-only weighting
+
+Phase D near-same-capacity follow-on:
+
+- opened only because `combined_focus` cleared the explicit same-capacity gate
+- cold-start `288x4` regressed to validation `23.803234 / 23.876484 / 201.930908 / 2.347200e-08`
+- cold-start `256x5` regressed to validation `24.007879 / 23.714962 / 195.058914 / 2.332956e-08`
+- near-same-capacity escalation therefore failed decisively and should stay closed from this anchor
+
+Current decision after the March 27 hard-tail closure packet:
+
+- continue the `projection-student` route from the same-capacity `combined_focus` anchor
+- stop cold-start near-same-capacity widening from this state
+- compression remains closed under the stricter reopen bar `<= 15 / <= 18 / <= 160 / <= 1e-6`
+- keep `DS` blocked
+- the credible next continuation, if any, is another narrow same-capacity preservation packet rather than a broader model-size search
 
 ## Final Program X Outcome
 
@@ -294,6 +338,7 @@ Projection-student root:
 
 - `experiment_runs/real_sim/projection_student_20260326/`
 - `experiment_runs/real_sim/projection_student_preservation_compression_20260327/`
+- `experiment_runs/real_sim/projection_student_hard_tail_closure_20260327/`
 
 Key projection-student outputs:
 
@@ -311,6 +356,10 @@ Key projection-student outputs:
 - March 27 preservation dataset summary: `experiment_runs/real_sim/projection_student_preservation_compression_20260327/exp2_preservation_dataset/preservation_dataset_summary.json`
 - March 27 preservation control summary: `experiment_runs/real_sim/projection_student_preservation_compression_20260327/exp3_preservation_control/phase3_summary.json`
 - March 27 compression decisions: `experiment_runs/real_sim/projection_student_preservation_compression_20260327/exp4_tier1_compression/phase4_summary.json`, `experiment_runs/real_sim/projection_student_preservation_compression_20260327/exp5_tier2_compression/phase5_summary.json`
+- March 27 hard-tail control-zero summary: `experiment_runs/real_sim/projection_student_hard_tail_closure_20260327/exp0_control_zero_slices/phase0_summary.json`
+- March 27 hard-tail same-capacity summary: `experiment_runs/real_sim/projection_student_hard_tail_closure_20260327/exp1_tail_closure_controls/phase1_summary.json`
+- March 27 hard-tail same-capacity rowwise val/test: `experiment_runs/real_sim/projection_student_hard_tail_closure_20260327/exp1_tail_closure_controls/best_same_capacity_val_rowwise.h5`, `experiment_runs/real_sim/projection_student_hard_tail_closure_20260327/exp1_tail_closure_controls/best_same_capacity_test_rowwise.h5`
+- March 27 hard-tail near-same-capacity summary: `experiment_runs/real_sim/projection_student_hard_tail_closure_20260327/exp2_near_same_capacity_followon/phase2_summary.json`
 
 Program X root:
 

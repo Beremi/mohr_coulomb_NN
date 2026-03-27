@@ -6,7 +6,7 @@ import csv
 import json
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import h5py
 import numpy as np
@@ -93,6 +93,15 @@ class TrainingConfig:
     tangent_fd_scale: float = 1.0e-6
     projection_mode: str = "exact"
     projection_tau: float = 0.05
+    projected_student_hard_loss_multiplier: float = 1.0
+    projected_student_any_boundary_loss_multiplier: float = 1.0
+    projected_student_high_disp_loss_multiplier: float = 1.0
+    projected_student_candidate_loss_weights: dict[int, float] | None = None
+    projected_student_branch_loss_weights: dict[int, float] | None = None
+    projected_student_teacher_alignment_focus_multiplier: float = 1.0
+    projected_student_hard_quantile: float = 0.0
+    projected_student_hard_quantile_weight: float = 0.0
+    projected_student_high_disp_threshold: float | None = None
 
 
 def set_seed(seed: int) -> None:
@@ -558,6 +567,7 @@ def _load_split_for_training(
     include_tangent: bool = False,
     feature_stats: dict[str, Any] | None = None,
     coordinate_scales: dict[str, float] | None = None,
+    projected_student_high_disp_threshold: float | None = None,
 ) -> dict[str, np.ndarray]:
     available = _dataset_keys(dataset_path)
     keys = ["strain_eng", "stress", "material_reduced"]
@@ -575,6 +585,12 @@ def _load_split_for_training(
         "teacher_projection_disp_norm",
         "ds_valid_mask",
         "sampling_weight",
+        "any_boundary_mask",
+        "near_yield_mask",
+        "near_smooth_left_mask",
+        "near_smooth_right_mask",
+        "near_left_apex_mask",
+        "near_right_apex_mask",
     ]
     if include_tangent and "tangent" in available:
         optional.append("tangent")
@@ -636,12 +652,60 @@ def _load_split_for_training(
         teacher_projection_disp_norm = np.full(arrays["strain_eng"].shape[0], np.nan, dtype=np.float32)
     else:
         teacher_projection_disp_norm = teacher_projection_disp_norm.astype(np.float32)
+    near_yield_mask = arrays.get("near_yield_mask")
+    near_smooth_left_mask = arrays.get("near_smooth_left_mask")
+    near_smooth_right_mask = arrays.get("near_smooth_right_mask")
+    near_left_apex_mask = arrays.get("near_left_apex_mask")
+    near_right_apex_mask = arrays.get("near_right_apex_mask")
+    any_boundary_mask = arrays.get("any_boundary_mask")
+    if near_yield_mask is None:
+        near_yield_mask = np.zeros(arrays["strain_eng"].shape[0], dtype=bool)
+    else:
+        near_yield_mask = near_yield_mask.astype(bool)
+    if near_smooth_left_mask is None:
+        near_smooth_left_mask = np.zeros(arrays["strain_eng"].shape[0], dtype=bool)
+    else:
+        near_smooth_left_mask = near_smooth_left_mask.astype(bool)
+    if near_smooth_right_mask is None:
+        near_smooth_right_mask = np.zeros(arrays["strain_eng"].shape[0], dtype=bool)
+    else:
+        near_smooth_right_mask = near_smooth_right_mask.astype(bool)
+    if near_left_apex_mask is None:
+        near_left_apex_mask = np.zeros(arrays["strain_eng"].shape[0], dtype=bool)
+    else:
+        near_left_apex_mask = near_left_apex_mask.astype(bool)
+    if near_right_apex_mask is None:
+        near_right_apex_mask = np.zeros(arrays["strain_eng"].shape[0], dtype=bool)
+    else:
+        near_right_apex_mask = near_right_apex_mask.astype(bool)
+    if any_boundary_mask is None:
+        any_boundary_mask = (
+            near_yield_mask
+            | near_smooth_left_mask
+            | near_smooth_right_mask
+            | near_left_apex_mask
+            | near_right_apex_mask
+        )
+    else:
+        any_boundary_mask = any_boundary_mask.astype(bool)
     ds_valid_mask = arrays.get("ds_valid_mask")
     if ds_valid_mask is not None:
         ds_valid_mask = ds_valid_mask.astype(bool)
     sampling_weight = arrays.get("sampling_weight")
     if sampling_weight is not None:
         sampling_weight = sampling_weight.astype(np.float32)
+    attrs = _dataset_attrs(dataset_path)
+    high_disp_threshold = projected_student_high_disp_threshold
+    if high_disp_threshold is None:
+        raw_threshold = attrs.get("high_disp_focus_threshold")
+        if raw_threshold is None:
+            raw_threshold = attrs.get("teacher_projection_disp_p90_train")
+        if raw_threshold is not None:
+            high_disp_threshold = float(raw_threshold)
+    if high_disp_threshold is None:
+        high_disp_mask = np.zeros(arrays["strain_eng"].shape[0], dtype=bool)
+    else:
+        high_disp_mask = np.isfinite(teacher_projection_disp_norm) & (teacher_projection_disp_norm >= float(high_disp_threshold))
 
     prepared = None
     if _is_acn_model(model_kind):
@@ -819,6 +883,13 @@ def _load_split_for_training(
         "teacher_projection_delta_principal": teacher_projection_delta_principal.astype(np.float32),
         "teacher_projection_candidate_id": teacher_projection_candidate_id.astype(np.int64),
         "teacher_projection_disp_norm": teacher_projection_disp_norm.astype(np.float32),
+        "near_yield_mask": near_yield_mask.astype(bool),
+        "near_smooth_left_mask": near_smooth_left_mask.astype(bool),
+        "near_smooth_right_mask": near_smooth_right_mask.astype(bool),
+        "near_left_apex_mask": near_left_apex_mask.astype(bool),
+        "near_right_apex_mask": near_right_apex_mask.astype(bool),
+        "any_boundary_mask": any_boundary_mask.astype(bool),
+        "high_disp_mask": high_disp_mask.astype(bool),
         "hard_mask": (hard_mask.astype(bool) if hard_mask is not None else np.zeros(arrays["strain_eng"].shape[0], dtype=bool)),
         "plastic_mask": (
             plastic_mask.astype(bool) if plastic_mask is not None else (branch_id > 0)
@@ -851,6 +922,10 @@ def _build_tensor_dataset(
     teacher_provisional_stress_principal = torch.from_numpy(split_arrays["teacher_provisional_stress_principal"])
     teacher_projected_stress_principal = torch.from_numpy(split_arrays["teacher_projected_stress_principal"])
     teacher_projection_delta_principal = torch.from_numpy(split_arrays["teacher_projection_delta_principal"])
+    hard_mask = torch.from_numpy(split_arrays["hard_mask"].astype(np.int8))
+    any_boundary_mask = torch.from_numpy(split_arrays["any_boundary_mask"].astype(np.int8))
+    high_disp_mask = torch.from_numpy(split_arrays["high_disp_mask"].astype(np.int8))
+    teacher_projection_candidate_id = torch.from_numpy(split_arrays["teacher_projection_candidate_id"])
     tangent_true = split_arrays.get("tangent_true")
     if tangent_true is None:
         tangent = torch.full((x.shape[0], 6, 6), float("nan"), dtype=torch.float32)
@@ -874,6 +949,10 @@ def _build_tensor_dataset(
         teacher_provisional_stress_principal,
         teacher_projected_stress_principal,
         teacher_projection_delta_principal,
+        hard_mask,
+        any_boundary_mask,
+        high_disp_mask,
+        teacher_projection_candidate_id,
         tangent,
     )
 
@@ -918,6 +997,67 @@ def _decode_projected_student_outputs(
         stress = stress.clone()
         stress[elastic_mask] = trial_stress[elastic_mask]
     return stress, projected_principal, provisional_principal
+
+
+def _weighted_mean(values: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
+    if weights is None:
+        return torch.mean(values)
+    return torch.sum(values * weights) / torch.clamp(torch.sum(weights), min=1.0e-12)
+
+
+def _normalize_weight_map(weight_map: Mapping[int, float] | None) -> dict[int, float]:
+    if not weight_map:
+        return {}
+    normalized: dict[int, float] = {}
+    for key, value in weight_map.items():
+        normalized[int(key)] = float(value)
+    return normalized
+
+
+def _projected_student_row_weights(
+    *,
+    hard_mask: torch.Tensor,
+    any_boundary_mask: torch.Tensor,
+    high_disp_mask: torch.Tensor,
+    teacher_projection_candidate_id: torch.Tensor,
+    branch_true: torch.Tensor,
+    hard_loss_multiplier: float,
+    any_boundary_loss_multiplier: float,
+    high_disp_loss_multiplier: float,
+    candidate_loss_weights: Mapping[int, float] | None,
+    branch_loss_weights: Mapping[int, float] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    weights = torch.ones(hard_mask.shape[0], dtype=torch.float32, device=hard_mask.device)
+    focus_mask = torch.zeros(hard_mask.shape[0], dtype=torch.bool, device=hard_mask.device)
+
+    if hard_loss_multiplier != 1.0:
+        hard_local = hard_mask > 0
+        weights = weights * torch.where(hard_local, weights.new_tensor(float(hard_loss_multiplier)), weights.new_tensor(1.0))
+        focus_mask |= hard_local
+    if any_boundary_loss_multiplier != 1.0:
+        boundary_local = any_boundary_mask > 0
+        weights = weights * torch.where(boundary_local, weights.new_tensor(float(any_boundary_loss_multiplier)), weights.new_tensor(1.0))
+        focus_mask |= boundary_local
+    if high_disp_loss_multiplier != 1.0:
+        high_disp_local = high_disp_mask > 0
+        weights = weights * torch.where(high_disp_local, weights.new_tensor(float(high_disp_loss_multiplier)), weights.new_tensor(1.0))
+        focus_mask |= high_disp_local
+
+    for bucket_id, multiplier in _normalize_weight_map(candidate_loss_weights).items():
+        if multiplier == 1.0:
+            continue
+        local = teacher_projection_candidate_id == int(bucket_id)
+        weights = weights * torch.where(local, weights.new_tensor(float(multiplier)), weights.new_tensor(1.0))
+        focus_mask |= local
+
+    for bucket_id, multiplier in _normalize_weight_map(branch_loss_weights).items():
+        if multiplier == 1.0:
+            continue
+        local = branch_true == int(bucket_id)
+        weights = weights * torch.where(local, weights.new_tensor(float(multiplier)), weights.new_tensor(1.0))
+        focus_mask |= local
+
+    return weights, focus_mask
 
 
 def _decode_acn_outputs(
@@ -1307,12 +1447,24 @@ def _regression_loss(
     teacher_provisional_stress_principal: torch.Tensor,
     teacher_projected_stress_principal: torch.Tensor,
     teacher_projection_delta_principal: torch.Tensor,
+    hard_mask: torch.Tensor,
+    any_boundary_mask: torch.Tensor,
+    high_disp_mask: torch.Tensor,
+    teacher_projection_candidate_id: torch.Tensor,
     branch_logits: torch.Tensor | None,
     stress_weight_alpha: float,
     stress_weight_scale: float,
     regression_loss_kind: str,
     huber_delta: float,
     voigt_mae_weight: float,
+    projected_student_hard_loss_multiplier: float = 1.0,
+    projected_student_any_boundary_loss_multiplier: float = 1.0,
+    projected_student_high_disp_loss_multiplier: float = 1.0,
+    projected_student_candidate_loss_weights: Mapping[int, float] | None = None,
+    projected_student_branch_loss_weights: Mapping[int, float] | None = None,
+    projected_student_teacher_alignment_focus_multiplier: float = 1.0,
+    projected_student_hard_quantile: float = 0.0,
+    projected_student_hard_quantile_weight: float = 0.0,
     coordinate_scales: dict[str, float] | None = None,
     projection_mode: str = "exact",
     projection_tau: float = 0.05,
@@ -1339,8 +1491,13 @@ def _regression_loss(
             teacher_projected_sel = teacher_projected_stress_principal[valid]
             teacher_delta_sel = teacher_projection_delta_principal[valid]
             c_bar_sel = material_reduced[valid, 0]
+            hard_sel = hard_mask[valid]
+            any_boundary_sel = any_boundary_mask[valid]
+            high_disp_sel = high_disp_mask[valid]
+            candidate_sel = teacher_projection_candidate_id[valid]
             branch_logits_sel = branch_logits[valid] if branch_logits is not None else None
-            branch_target = branch_true[valid] - 1
+            branch_true_sel = branch_true[valid]
+            branch_target = branch_true_sel - 1
         else:
             stress_pred_sel = stress_pred[:1]
             stress_true_sel = stress_true[:1]
@@ -1351,29 +1508,81 @@ def _regression_loss(
             teacher_projected_sel = teacher_projected_stress_principal[:1]
             teacher_delta_sel = teacher_projection_delta_principal[:1]
             c_bar_sel = material_reduced[:1, 0]
+            hard_sel = hard_mask[:1]
+            any_boundary_sel = any_boundary_mask[:1]
+            high_disp_sel = high_disp_mask[:1]
+            candidate_sel = teacher_projection_candidate_id[:1]
             branch_logits_sel = branch_logits[:1] if branch_logits is not None else None
+            branch_true_sel = branch_true[:1]
             branch_target = torch.zeros((1,), dtype=torch.long, device=pred_norm.device)
 
         use_preservation_targets = bool(
             torch.isfinite(teacher_projected_sel).all().detach().cpu()
             and torch.isfinite(teacher_delta_sel).all().detach().cpu()
         )
-        principal_huber = nn.functional.huber_loss(principal_pred_sel, principal_true_sel, delta=huber_delta)
+        principal_row_huber = nn.functional.huber_loss(
+            principal_pred_sel,
+            principal_true_sel,
+            delta=huber_delta,
+            reduction="none",
+        ).mean(dim=1)
+        principal_huber = torch.mean(principal_row_huber)
         stress_mae = torch.mean(torch.abs(stress_pred_sel - stress_true_sel))
         if branch_logits_sel is not None:
-            branch_ce = nn.functional.cross_entropy(branch_logits_sel, branch_target)
+            branch_ce_row = nn.functional.cross_entropy(branch_logits_sel, branch_target, reduction="none")
+            branch_ce = torch.mean(branch_ce_row)
         else:
+            branch_ce_row = pred_norm.new_zeros(principal_pred_sel.shape[0])
             branch_ce = pred_norm.new_tensor(0.0)
 
+        row_weights, focus_mask = _projected_student_row_weights(
+            hard_mask=hard_sel,
+            any_boundary_mask=any_boundary_sel,
+            high_disp_mask=high_disp_sel,
+            teacher_projection_candidate_id=candidate_sel,
+            branch_true=branch_true_sel,
+            hard_loss_multiplier=projected_student_hard_loss_multiplier,
+            any_boundary_loss_multiplier=projected_student_any_boundary_loss_multiplier,
+            high_disp_loss_multiplier=projected_student_high_disp_loss_multiplier,
+            candidate_loss_weights=projected_student_candidate_loss_weights,
+            branch_loss_weights=projected_student_branch_loss_weights,
+        )
+        teacher_row_weights = row_weights.clone()
+        if projected_student_teacher_alignment_focus_multiplier != 1.0:
+            teacher_row_weights = teacher_row_weights * torch.where(
+                focus_mask,
+                teacher_row_weights.new_tensor(float(projected_student_teacher_alignment_focus_multiplier)),
+                teacher_row_weights.new_tensor(1.0),
+            )
+
         if use_preservation_targets:
-            projected_teacher_huber = nn.functional.huber_loss(principal_pred_sel, teacher_projected_sel, delta=huber_delta)
-            provisional_teacher_huber = nn.functional.huber_loss(provisional_sel, teacher_provisional_sel, delta=huber_delta)
+            projected_teacher_row_huber = nn.functional.huber_loss(
+                principal_pred_sel,
+                teacher_projected_sel,
+                delta=huber_delta,
+                reduction="none",
+            ).mean(dim=1)
+            provisional_teacher_row_huber = nn.functional.huber_loss(
+                provisional_sel,
+                teacher_provisional_sel,
+                delta=huber_delta,
+                reduction="none",
+            ).mean(dim=1)
             projection_delta_student = principal_pred_sel - provisional_sel
-            projection_delta_huber = nn.functional.huber_loss(
+            projection_delta_row_huber = nn.functional.huber_loss(
                 projection_delta_student,
                 teacher_delta_sel,
                 delta=huber_delta,
+                reduction="none",
+            ).mean(dim=1)
+            projected_teacher_huber = _weighted_mean(projected_teacher_row_huber, teacher_row_weights)
+            provisional_teacher_huber = _weighted_mean(provisional_teacher_row_huber, row_weights)
+            projection_delta_huber = _weighted_mean(
+                projection_delta_row_huber,
+                teacher_row_weights,
             )
+            principal_huber = _weighted_mean(principal_row_huber, row_weights)
+            branch_ce = _weighted_mean(branch_ce_row, row_weights) if branch_logits_sel is not None else pred_norm.new_tensor(0.0)
             total = (
                 1.00 * principal_huber
                 + 0.75 * projected_teacher_huber
@@ -1381,6 +1590,23 @@ def _regression_loss(
                 + 0.25 * projection_delta_huber
                 + 0.10 * branch_ce
             )
+            hard_quantile_huber = pred_norm.new_tensor(0.0)
+            hard_quantile_threshold = float("nan")
+            hard_quantile_rows = 0
+            if projected_student_hard_quantile_weight > 0.0 and projected_student_hard_quantile > 0.0:
+                hard_local = hard_sel > 0
+                if torch.any(hard_local):
+                    hard_max_abs = torch.max(torch.abs(principal_pred_sel - principal_true_sel), dim=1).values[hard_local]
+                    hard_quantile_threshold = float(torch.quantile(hard_max_abs, float(projected_student_hard_quantile)).detach().cpu())
+                    tail_mask = hard_local & (torch.max(torch.abs(principal_pred_sel - principal_true_sel), dim=1).values >= hard_max_abs.new_tensor(hard_quantile_threshold))
+                    hard_quantile_rows = int(torch.sum(tail_mask).detach().cpu())
+                    if hard_quantile_rows > 0:
+                        hard_quantile_huber = nn.functional.huber_loss(
+                            principal_pred_sel[tail_mask],
+                            principal_true_sel[tail_mask],
+                            delta=huber_delta,
+                        )
+                        total = total + float(projected_student_hard_quantile_weight) * hard_quantile_huber
             metrics = {
                 "regression_mse": float(torch.mean((principal_pred_sel - principal_true_sel) ** 2).detach().cpu()),
                 "stress_mse": float(torch.mean((stress_pred - stress_true) ** 2).detach().cpu()),
@@ -1391,12 +1617,26 @@ def _regression_loss(
                 "projection_delta_huber_loss": float(projection_delta_huber.detach().cpu()),
                 "projection_disp_mean": float(torch.mean(torch.linalg.norm(principal_pred_sel - provisional_sel, dim=1)).detach().cpu()),
                 "branch_ce_loss": float(branch_ce.detach().cpu()),
+                "projected_student_focus_fraction": float(torch.mean(focus_mask.float()).detach().cpu()),
+                "projected_student_row_weight_mean": float(torch.mean(row_weights).detach().cpu()),
+                "projected_student_teacher_row_weight_mean": float(torch.mean(teacher_row_weights).detach().cpu()),
+                "hard_quantile_huber_loss": float(hard_quantile_huber.detach().cpu()),
+                "hard_quantile_threshold": hard_quantile_threshold,
+                "hard_quantile_rows": float(hard_quantile_rows),
             }
         else:
-            teacher_huber = nn.functional.huber_loss(provisional_sel, teacher_provisional_sel, delta=huber_delta)
+            teacher_row_huber = nn.functional.huber_loss(
+                provisional_sel,
+                teacher_provisional_sel,
+                delta=huber_delta,
+                reduction="none",
+            ).mean(dim=1)
             disp_norm = torch.linalg.norm(principal_pred_sel - provisional_sel, dim=1)
             disp_denom = torch.linalg.norm(teacher_provisional_sel, dim=1) + c_bar_sel + 1.0
-            disp_penalty = torch.mean(disp_norm / torch.clamp(disp_denom, min=1.0e-12))
+            disp_penalty = _weighted_mean(disp_norm / torch.clamp(disp_denom, min=1.0e-12), row_weights)
+            principal_huber = _weighted_mean(principal_row_huber, row_weights)
+            teacher_huber = _weighted_mean(teacher_row_huber, teacher_row_weights)
+            branch_ce = _weighted_mean(branch_ce_row, row_weights) if branch_logits_sel is not None else pred_norm.new_tensor(0.0)
             total = principal_huber + 0.5 * stress_mae + 0.25 * teacher_huber + 0.05 * disp_penalty + 0.05 * branch_ce
             metrics = {
                 "regression_mse": float(torch.mean((principal_pred_sel - principal_true_sel) ** 2).detach().cpu()),
@@ -1407,6 +1647,12 @@ def _regression_loss(
                 "projection_disp_mean": float(torch.mean(torch.linalg.norm(principal_pred_sel - provisional_sel, dim=1)).detach().cpu()),
                 "teacher_huber_loss": float(teacher_huber.detach().cpu()),
                 "branch_ce_loss": float(branch_ce.detach().cpu()),
+                "projected_student_focus_fraction": float(torch.mean(focus_mask.float()).detach().cpu()),
+                "projected_student_row_weight_mean": float(torch.mean(row_weights).detach().cpu()),
+                "projected_student_teacher_row_weight_mean": float(torch.mean(teacher_row_weights).detach().cpu()),
+                "hard_quantile_huber_loss": 0.0,
+                "hard_quantile_threshold": float("nan"),
+                "hard_quantile_rows": 0.0,
             }
         return total, metrics
 
@@ -1859,6 +2105,14 @@ def _epoch_loop(
     voigt_mae_weight: float,
     tangent_loss_weight: float,
     tangent_fd_scale: float,
+    projected_student_hard_loss_multiplier: float = 1.0,
+    projected_student_any_boundary_loss_multiplier: float = 1.0,
+    projected_student_high_disp_loss_multiplier: float = 1.0,
+    projected_student_candidate_loss_weights: Mapping[int, float] | None = None,
+    projected_student_branch_loss_weights: Mapping[int, float] | None = None,
+    projected_student_teacher_alignment_focus_multiplier: float = 1.0,
+    projected_student_hard_quantile: float = 0.0,
+    projected_student_hard_quantile_weight: float = 0.0,
     feature_stats: dict[str, Any] | None = None,
     coordinate_scales: dict[str, float] | None = None,
     symmetry_loss_weight: float = 0.05,
@@ -1878,7 +2132,7 @@ def _epoch_loop(
     n_branch_samples = 0
     n_samples = 0
 
-    for xb, yb, branch, stress_true, stress_principal_true, eigvecs, trial_stress, trial_principal, abr_true_raw, abr_true_nonneg, grho_true, soft_atlas_route_target, strain_eng, material_reduced, teacher_provisional_stress_principal, teacher_projected_stress_principal, teacher_projection_delta_principal, tangent_true in loader:
+    for xb, yb, branch, stress_true, stress_principal_true, eigvecs, trial_stress, trial_principal, abr_true_raw, abr_true_nonneg, grho_true, soft_atlas_route_target, strain_eng, material_reduced, teacher_provisional_stress_principal, teacher_projected_stress_principal, teacher_projection_delta_principal, hard_mask, any_boundary_mask, high_disp_mask, teacher_projection_candidate_id, tangent_true in loader:
         xb = xb.to(device)
         yb = yb.to(device)
         branch = branch.to(device)
@@ -1896,6 +2150,10 @@ def _epoch_loop(
         teacher_provisional_stress_principal = teacher_provisional_stress_principal.to(device)
         teacher_projected_stress_principal = teacher_projected_stress_principal.to(device)
         teacher_projection_delta_principal = teacher_projection_delta_principal.to(device)
+        hard_mask = hard_mask.to(device)
+        any_boundary_mask = any_boundary_mask.to(device)
+        high_disp_mask = high_disp_mask.to(device)
+        teacher_projection_candidate_id = teacher_projection_candidate_id.to(device)
         tangent_true = tangent_true.to(device)
 
         if training:
@@ -1923,6 +2181,10 @@ def _epoch_loop(
             teacher_provisional_stress_principal=teacher_provisional_stress_principal,
             teacher_projected_stress_principal=teacher_projected_stress_principal,
             teacher_projection_delta_principal=teacher_projection_delta_principal,
+            hard_mask=hard_mask,
+            any_boundary_mask=any_boundary_mask,
+            high_disp_mask=high_disp_mask,
+            teacher_projection_candidate_id=teacher_projection_candidate_id,
             coordinate_scales=coordinate_scales,
             branch_logits=out.get("branch_logits"),
             stress_weight_alpha=stress_weight_alpha,
@@ -1930,6 +2192,14 @@ def _epoch_loop(
             regression_loss_kind=regression_loss_kind,
             huber_delta=huber_delta,
             voigt_mae_weight=voigt_mae_weight,
+            projected_student_hard_loss_multiplier=projected_student_hard_loss_multiplier,
+            projected_student_any_boundary_loss_multiplier=projected_student_any_boundary_loss_multiplier,
+            projected_student_high_disp_loss_multiplier=projected_student_high_disp_loss_multiplier,
+            projected_student_candidate_loss_weights=projected_student_candidate_loss_weights,
+            projected_student_branch_loss_weights=projected_student_branch_loss_weights,
+            projected_student_teacher_alignment_focus_multiplier=projected_student_teacher_alignment_focus_multiplier,
+            projected_student_hard_quantile=projected_student_hard_quantile,
+            projected_student_hard_quantile_weight=projected_student_hard_quantile_weight,
             projection_mode=projection_mode,
             projection_tau=projection_tau,
         )
@@ -2171,6 +2441,7 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
         include_tangent=config.tangent_loss_weight > 0.0,
         feature_stats=feature_stats,
         coordinate_scales=coordinate_scales,
+        projected_student_high_disp_threshold=config.projected_student_high_disp_threshold,
     )
     if _is_acn_model(config.model_kind):
         if feature_stats is None:
@@ -2203,6 +2474,7 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
         include_tangent=config.tangent_loss_weight > 0.0,
         feature_stats=feature_stats,
         coordinate_scales=coordinate_scales,
+        projected_student_high_disp_threshold=config.projected_student_high_disp_threshold,
     )
 
     if _is_surface_model(config.model_kind) and np.any(train_arrays["branch_id"] > 0):
@@ -2362,6 +2634,14 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
             voigt_mae_weight=config.voigt_mae_weight,
             tangent_loss_weight=config.tangent_loss_weight,
             tangent_fd_scale=config.tangent_fd_scale,
+            projected_student_hard_loss_multiplier=config.projected_student_hard_loss_multiplier,
+            projected_student_any_boundary_loss_multiplier=config.projected_student_any_boundary_loss_multiplier,
+            projected_student_high_disp_loss_multiplier=config.projected_student_high_disp_loss_multiplier,
+            projected_student_candidate_loss_weights=config.projected_student_candidate_loss_weights,
+            projected_student_branch_loss_weights=config.projected_student_branch_loss_weights,
+            projected_student_teacher_alignment_focus_multiplier=config.projected_student_teacher_alignment_focus_multiplier,
+            projected_student_hard_quantile=config.projected_student_hard_quantile,
+            projected_student_hard_quantile_weight=config.projected_student_hard_quantile_weight,
         )
         val_metrics = _epoch_loop(
             model=model,
@@ -2384,6 +2664,14 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
             voigt_mae_weight=config.voigt_mae_weight,
             tangent_loss_weight=config.tangent_loss_weight,
             tangent_fd_scale=config.tangent_fd_scale,
+            projected_student_hard_loss_multiplier=config.projected_student_hard_loss_multiplier,
+            projected_student_any_boundary_loss_multiplier=config.projected_student_any_boundary_loss_multiplier,
+            projected_student_high_disp_loss_multiplier=config.projected_student_high_disp_loss_multiplier,
+            projected_student_candidate_loss_weights=config.projected_student_candidate_loss_weights,
+            projected_student_branch_loss_weights=config.projected_student_branch_loss_weights,
+            projected_student_teacher_alignment_focus_multiplier=config.projected_student_teacher_alignment_focus_multiplier,
+            projected_student_hard_quantile=config.projected_student_hard_quantile,
+            projected_student_hard_quantile_weight=config.projected_student_hard_quantile_weight,
         )
 
         if scheduler is not None:
@@ -2451,7 +2739,7 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
         )
 
         for lbfgs_epoch in range(1, config.lbfgs_epochs + 1):
-            xb, yb, branch, stress_true, stress_principal_true, eigvecs, trial_stress, trial_principal, abr_true_raw, abr_true_nonneg, grho_true, soft_atlas_route_target, strain_eng, material_reduced, teacher_provisional_stress_principal, teacher_projected_stress_principal, teacher_projection_delta_principal, tangent_true = train_full
+            xb, yb, branch, stress_true, stress_principal_true, eigvecs, trial_stress, trial_principal, abr_true_raw, abr_true_nonneg, grho_true, soft_atlas_route_target, strain_eng, material_reduced, teacher_provisional_stress_principal, teacher_projected_stress_principal, teacher_projection_delta_principal, hard_mask, any_boundary_mask, high_disp_mask, teacher_projection_candidate_id, tangent_true = train_full
 
             def closure() -> torch.Tensor:
                 lbfgs.zero_grad(set_to_none=True)
@@ -2477,6 +2765,10 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
                     teacher_provisional_stress_principal=teacher_provisional_stress_principal,
                     teacher_projected_stress_principal=teacher_projected_stress_principal,
                     teacher_projection_delta_principal=teacher_projection_delta_principal,
+                    hard_mask=hard_mask,
+                    any_boundary_mask=any_boundary_mask,
+                    high_disp_mask=high_disp_mask,
+                    teacher_projection_candidate_id=teacher_projection_candidate_id,
                     coordinate_scales=coordinate_scales,
                     branch_logits=out.get("branch_logits"),
                     stress_weight_alpha=config.stress_weight_alpha,
@@ -2484,6 +2776,14 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
                     regression_loss_kind=config.regression_loss_kind,
                     huber_delta=config.huber_delta,
                     voigt_mae_weight=config.voigt_mae_weight,
+                    projected_student_hard_loss_multiplier=config.projected_student_hard_loss_multiplier,
+                    projected_student_any_boundary_loss_multiplier=config.projected_student_any_boundary_loss_multiplier,
+                    projected_student_high_disp_loss_multiplier=config.projected_student_high_disp_loss_multiplier,
+                    projected_student_candidate_loss_weights=config.projected_student_candidate_loss_weights,
+                    projected_student_branch_loss_weights=config.projected_student_branch_loss_weights,
+                    projected_student_teacher_alignment_focus_multiplier=config.projected_student_teacher_alignment_focus_multiplier,
+                    projected_student_hard_quantile=config.projected_student_hard_quantile,
+                    projected_student_hard_quantile_weight=config.projected_student_hard_quantile_weight,
                     projection_mode=config.projection_mode,
                     projection_tau=config.projection_tau,
                 )
@@ -2539,6 +2839,14 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
                 voigt_mae_weight=config.voigt_mae_weight,
                 tangent_loss_weight=config.tangent_loss_weight,
                 tangent_fd_scale=config.tangent_fd_scale,
+                projected_student_hard_loss_multiplier=config.projected_student_hard_loss_multiplier,
+                projected_student_any_boundary_loss_multiplier=config.projected_student_any_boundary_loss_multiplier,
+                projected_student_high_disp_loss_multiplier=config.projected_student_high_disp_loss_multiplier,
+                projected_student_candidate_loss_weights=config.projected_student_candidate_loss_weights,
+                projected_student_branch_loss_weights=config.projected_student_branch_loss_weights,
+                projected_student_teacher_alignment_focus_multiplier=config.projected_student_teacher_alignment_focus_multiplier,
+                projected_student_hard_quantile=config.projected_student_hard_quantile,
+                projected_student_hard_quantile_weight=config.projected_student_hard_quantile_weight,
             )
             val_metrics = _epoch_loop(
                 model=model,
@@ -2561,6 +2869,14 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
                 voigt_mae_weight=config.voigt_mae_weight,
                 tangent_loss_weight=config.tangent_loss_weight,
                 tangent_fd_scale=config.tangent_fd_scale,
+                projected_student_hard_loss_multiplier=config.projected_student_hard_loss_multiplier,
+                projected_student_any_boundary_loss_multiplier=config.projected_student_any_boundary_loss_multiplier,
+                projected_student_high_disp_loss_multiplier=config.projected_student_high_disp_loss_multiplier,
+                projected_student_candidate_loss_weights=config.projected_student_candidate_loss_weights,
+                projected_student_branch_loss_weights=config.projected_student_branch_loss_weights,
+                projected_student_teacher_alignment_focus_multiplier=config.projected_student_teacher_alignment_focus_multiplier,
+                projected_student_hard_quantile=config.projected_student_hard_quantile,
+                projected_student_hard_quantile_weight=config.projected_student_hard_quantile_weight,
             )
             epoch = completed_epochs + lbfgs_epoch
             current_lr = lbfgs.param_groups[0]["lr"]
