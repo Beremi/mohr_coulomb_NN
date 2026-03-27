@@ -17,10 +17,10 @@ Read this first.
 - Date: `2026-03-27`
 - Canonical closeout for the absorbed historical report stack: `docs/repository_general_report_20260326.md`
 - Canonical closeout for the local cover-layer prehistory: `docs/cover_layer_comprehensive_report_20260326.md`
-- Last executed program: `projection-student hard-tail closure packet`
+- Last executed program: `projection-student tail reopen packet`
 - Current program state: `continue_projection_student`
-- Reason: the same-capacity March 27 hard-tail closure winner `combined_focus` cleared the explicit `<= 18 / <= 20 / <= 180 / <= 1e-6` gate at validation `16.687582 / 18.913580 / 176.145065 / 2.310791e-08`, but both cold-start near-same-capacity follow-ons regressed badly, so the route stays alive only in the same-capacity projection-student preservation family while compression remains closed under the stricter reopen bar
-- `DS` status: still blocked; the projected-teacher probe remained mixed and the new best student is still far above the `DS` reopen bar
+- Reason: the March 27 same-capacity warm-restart tail-reopen packet improved the live anchor from `16.687582 / 18.913580 / 176.145065 / 2.310791e-08` to `15.899072 / 18.059217 / 170.881073 / 2.263277e-08` on validation via `anchor_ema_restart`, which passed the packet stop-rule improvement bar but still missed the reopen bar `<= 15 / <= 18 / <= 160 / <= 1e-6`, so compression remains closed while the route continues only as a very narrow same-capacity continuation
+- `DS` status: still blocked; the projected-teacher tangent probe stayed finite with exact mode best and tiny candidate-switch rates, so the teacher tangent path remains diagnostically alive, but no student is close to the student `DS` reopen bar
 
 ## Projection-Student Outcome
 
@@ -168,6 +168,56 @@ Current decision after the March 27 hard-tail closure packet:
 - compression remains closed under the stricter reopen bar `<= 15 / <= 18 / <= 160 / <= 1e-6`
 - keep `DS` blocked
 - the credible next continuation, if any, is another narrow same-capacity preservation packet rather than a broader model-size search
+
+## Projection-Student Tail Reopen Outcome
+
+The March 27 tail-reopen packet kept the live route inside the same-capacity warm-start preservation family and asked whether the `combined_focus` anchor could close the stricter reopen bar without reopening any retired branch.
+
+Implemented artifacts live under:
+
+- `experiment_runs/real_sim/projection_student_tail_reopen_20260327/`
+- `docs/tasks/projection_student_tail_reopen_work_packet_20260327.md`
+- `docs/executions/projection_student_tail_reopen_work_packet_20260327.md`
+
+Phase 0 anchor freeze:
+
+- the hard-tail-closure winner `combined_focus` was frozen again at `experiment_runs/real_sim/projection_student_hard_tail_closure_20260327/exp1_tail_closure_controls/combined_focus/best.pt`
+- reproducibility passed on the canonical split with validation `16.687582 / 18.913580 / 176.145065 / 2.310791e-08` and test `17.594461 / 19.734207 / 183.963257 / 2.290212e-08`
+- new train / val / test rowwise artifacts were written for the tail-reopen packet so the remaining train-side student-teacher gap could be localized without validation leakage
+
+Phase 1 train-side teacher-gap audit:
+
+- train-side weighting thresholds were localized at `gap_q90 = 95.042069`, `gap_q95 = 141.095757`, `delta_q90 = 373.594583`, `teacher_disp_q90 = 7.308768`
+- the remaining train gap stayed concentrated enough to justify bounded focus on teacher-gap tails and edge/apex-adjacent rows, but not enough to justify a broader family reopen
+
+Phase 2 projected-teacher `DS` probe:
+
+- exact mode remained the best tangent diagnostic on both `ds_valid_val` and `ds_valid_test`
+- plastic directional relative-error p95 stayed around `1.0458` / `1.0437` with cosine mean around `0.8977` / `0.9007`
+- finite rate stayed `1.0` and candidate-switch rates stayed tiny (`~6.1e-4` / `~8.5e-4`)
+- the softmin tau grid `0.25 / 0.50 / 1.00` made tangent quality worse rather than better, so the projected teacher remains diagnostically interesting but not tangent-open
+
+Phase 3 same-capacity warm-start refinement:
+
+- `anchor_ema_restart` won the packet at validation `15.899072 / 18.059217 / 170.881073 / 2.263277e-08` and test `16.647007 / 18.692650 / 176.318420 / 2.301265e-08`
+- this best run improved the anchor by about `0.789 / 0.854 / 5.264` on validation broad / hard / p95, so the packet stop rule was **not** triggered
+- `teacher_gap_cvar` regressed badly to validation `18.591162 / 21.898859 / 217.325394 / 2.295379e-08`
+- `edge_apex_delta_focus` also regressed to validation `18.217728 / 21.011776 / 192.699768 / 2.204672e-08`
+- `full_combo_ema` stayed worse than the anchor on validation at `16.981205 / 19.520977 / 182.852615 / 2.222299e-08`
+- the main positive signal was therefore low-LR EMA warm restart from the anchor, not stronger train-gap or edge/apex reweighting
+
+Phase 4 full-real follow-on:
+
+- skipped
+- reason: the best Phase 3 run materially improved the anchor but did **not** meet the narrow follow-on opening condition `<= 15.8 / <= 18.4 / <= 168 / <= 1e-6`
+
+Current decision after the March 27 tail-reopen packet:
+
+- continue the `projection-student` route only from the same-capacity `anchor_ema_restart` warm-restart winner
+- keep compression closed because the reopen bar `<= 15 / <= 18 / <= 160 / <= 1e-6` was still missed
+- keep student `DS` closed
+- keep cold-start widening, routing redesign, atlas variants, exact-latent follow-ons, and separate tangent heads closed
+- the only credible continuation from here is another very narrow same-capacity continuation; the evidence does not support reopening broader branches
 
 ## Final Program X Outcome
 

@@ -24,6 +24,8 @@ from mc_surrogate.training import (
     _regression_loss,
     _decode_projected_student_outputs,
     evaluate_checkpoint_on_dataset,
+    load_checkpoint,
+    predict_with_loaded_checkpoint,
     train_model,
 )
 
@@ -323,6 +325,102 @@ def test_train_projected_student_with_preservation_fields_and_sampling_weight(tm
     assert "principal_mae" in eval_result["metrics"]
 
 
+def test_train_projected_student_ema_warm_restart_checkpoint_is_loadable(tmp_path: Path):
+    dataset_path = tmp_path / "train_projected_student_ema_base.h5"
+    projected_dataset_path = tmp_path / "train_projected_student_ema.h5"
+    init_run_dir = tmp_path / "run_projected_student_init"
+    ema_run_dir = tmp_path / "run_projected_student_ema"
+    generate_branch_balanced_dataset(
+        str(dataset_path),
+        DatasetGenerationConfig(
+            n_samples=64,
+            seed=11,
+            candidate_batch=128,
+            max_abs_principal_strain=2.0e-3,
+        ),
+    )
+
+    with h5py.File(dataset_path, "r") as src, h5py.File(projected_dataset_path, "w") as dst:
+        plastic_mask = src["branch_id"][:] > 0
+        for key in src.keys():
+            value = src[key][:]
+            if value.shape[0] == plastic_mask.shape[0]:
+                value = value[plastic_mask]
+            dst.create_dataset(key, data=value)
+
+        strain_eng = src["strain_eng"][:][plastic_mask]
+        material_reduced = src["material_reduced"][:][plastic_mask]
+        stress_principal = src["stress_principal"][:][plastic_mask]
+        trial_principal = exact_trial_principal_from_strain(strain_eng, material_reduced)
+        strain_principal, _eigvecs = spectral_decomposition_from_strain(strain_eng)
+        geom_features = build_trial_principal_geom_features(strain_principal, material_reduced, trial_principal)
+
+        dst.create_dataset("teacher_provisional_stress_principal", data=stress_principal)
+        dst.create_dataset("teacher_projected_stress_principal", data=stress_principal)
+        dst.create_dataset("teacher_projection_delta_principal", data=np.zeros_like(stress_principal, dtype=np.float32))
+        dst.create_dataset("teacher_projection_candidate_id", data=np.zeros(stress_principal.shape[0], dtype=np.int8))
+        dst.create_dataset("teacher_projection_disp_norm", data=np.zeros(stress_principal.shape[0], dtype=np.float32))
+        dst.create_dataset("ds_valid_mask", data=np.ones(stress_principal.shape[0], dtype=np.int8))
+        dst.create_dataset("sampling_weight", data=np.linspace(1.0, 2.0, stress_principal.shape[0], dtype=np.float32))
+        dst.create_dataset("trial_principal_geom_feature_f1", data=geom_features.astype(np.float32))
+        for key, value in src.attrs.items():
+            dst.attrs[key] = value
+
+    init_summary = train_model(
+        TrainingConfig(
+            dataset=str(projected_dataset_path),
+            run_dir=str(init_run_dir),
+            model_kind="trial_principal_geom_projected_student",
+            epochs=1,
+            batch_size=16,
+            lr=1.0e-3,
+            width=32,
+            depth=1,
+            seed=11,
+            patience=2,
+            device="cpu",
+            scheduler_kind="plateau",
+            regression_loss_kind="huber",
+        )
+    )
+    summary = train_model(
+        TrainingConfig(
+            dataset=str(projected_dataset_path),
+            run_dir=str(ema_run_dir),
+            model_kind="trial_principal_geom_projected_student",
+            epochs=2,
+            batch_size=16,
+            lr=1.0e-3,
+            width=32,
+            depth=1,
+            seed=12,
+            patience=2,
+            device="cpu",
+            scheduler_kind="plateau",
+            regression_loss_kind="huber",
+            init_checkpoint=init_summary["best_checkpoint"],
+            ema_decay=0.9,
+        )
+    )
+
+    model, metadata = load_checkpoint(summary["best_checkpoint"], device="cpu")
+    pred = predict_with_loaded_checkpoint(
+        model,
+        metadata,
+        strain_eng[:4],
+        material_reduced[:4],
+        device="cpu",
+    )
+    eval_result = evaluate_checkpoint_on_dataset(summary["best_checkpoint"], projected_dataset_path, split="test", device="cpu")
+
+    assert summary["ema_enabled"] is True
+    assert summary["ema_decay"] == pytest.approx(0.9)
+    assert metadata["config"]["ema_decay"] == pytest.approx(0.9)
+    assert (ema_run_dir / "best.pt").exists()
+    assert "principal_mae" in eval_result["metrics"]
+    assert pred["stress_principal"].shape[0] == 4
+
+
 def test_load_split_for_training_handles_optional_boundary_fields(tmp_path: Path):
     dataset_path = tmp_path / "train_projected_student_schema.h5"
     projected_dataset_path = tmp_path / "train_projected_student_schema_projected.h5"
@@ -450,12 +548,16 @@ def test_projected_student_regression_loss_defaults_match_preservation_formula()
         material_reduced=material_reduced,
         teacher_provisional_stress_principal=teacher_provisional,
         teacher_projected_stress_principal=teacher_projected,
-        teacher_projection_delta_principal=teacher_delta,
-        hard_mask=torch.tensor([1, 1], dtype=torch.int8),
-        any_boundary_mask=torch.tensor([0, 0], dtype=torch.int8),
-        high_disp_mask=torch.tensor([0, 0], dtype=torch.int8),
-        teacher_projection_candidate_id=torch.tensor([0, 0], dtype=torch.int64),
-        branch_logits=branch_logits,
+            teacher_projection_delta_principal=teacher_delta,
+            hard_mask=torch.tensor([1, 1], dtype=torch.int8),
+            any_boundary_mask=torch.tensor([0, 0], dtype=torch.int8),
+            teacher_gap_q90_mask=torch.tensor([0, 0], dtype=torch.int8),
+            teacher_gap_q95_mask=torch.tensor([0, 0], dtype=torch.int8),
+            delta_gap_q90_mask=torch.tensor([0, 0], dtype=torch.int8),
+            edge_apex_adjacent_mask=torch.tensor([0, 0], dtype=torch.int8),
+            high_disp_mask=torch.tensor([0, 0], dtype=torch.int8),
+            teacher_projection_candidate_id=torch.tensor([0, 0], dtype=torch.int64),
+            branch_logits=branch_logits,
         stress_weight_alpha=0.0,
         stress_weight_scale=250.0,
         regression_loss_kind="huber",
@@ -557,12 +659,16 @@ def test_projected_student_regression_loss_tail_focus_is_finite():
         material_reduced=material_reduced,
         teacher_provisional_stress_principal=teacher_provisional,
         teacher_projected_stress_principal=teacher_projected,
-        teacher_projection_delta_principal=teacher_delta,
-        hard_mask=torch.tensor([1, 0, 1], dtype=torch.int8),
-        any_boundary_mask=torch.tensor([0, 1, 1], dtype=torch.int8),
-        high_disp_mask=torch.tensor([0, 0, 1], dtype=torch.int8),
-        teacher_projection_candidate_id=torch.tensor([0, 2, 2], dtype=torch.int64),
-        branch_logits=branch_logits,
+            teacher_projection_delta_principal=teacher_delta,
+            hard_mask=torch.tensor([1, 0, 1], dtype=torch.int8),
+            any_boundary_mask=torch.tensor([0, 1, 1], dtype=torch.int8),
+            teacher_gap_q90_mask=torch.tensor([0, 1, 0], dtype=torch.int8),
+            teacher_gap_q95_mask=torch.tensor([0, 0, 1], dtype=torch.int8),
+            delta_gap_q90_mask=torch.tensor([0, 0, 1], dtype=torch.int8),
+            edge_apex_adjacent_mask=torch.tensor([0, 1, 1], dtype=torch.int8),
+            high_disp_mask=torch.tensor([0, 0, 1], dtype=torch.int8),
+            teacher_projection_candidate_id=torch.tensor([0, 2, 2], dtype=torch.int64),
+            branch_logits=branch_logits,
         stress_weight_alpha=0.0,
         stress_weight_scale=250.0,
         regression_loss_kind="huber",

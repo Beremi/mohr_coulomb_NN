@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import csv
 import json
 from dataclasses import dataclass, asdict
@@ -52,6 +53,36 @@ def choose_device(device: str = "auto") -> torch.device:
     return torch.device(device)
 
 
+def _clone_state_dict(state_dict: Mapping[str, Any]) -> dict[str, Any]:
+    cloned: dict[str, Any] = {}
+    for key, value in state_dict.items():
+        if torch.is_tensor(value):
+            cloned[key] = value.detach().clone()
+        else:
+            cloned[key] = copy.deepcopy(value)
+    return cloned
+
+
+def _update_ema_state_dict(
+    ema_state_dict: dict[str, Any],
+    model: nn.Module,
+    decay: float,
+) -> None:
+    if decay <= 0.0:
+        return
+    model_state = model.state_dict()
+    with torch.no_grad():
+        for key, ema_value in ema_state_dict.items():
+            model_value = model_state[key]
+            if torch.is_tensor(ema_value) and torch.is_tensor(model_value):
+                if torch.is_floating_point(ema_value) or torch.is_complex(ema_value):
+                    ema_value.mul_(decay).add_(model_value.detach(), alpha=1.0 - decay)
+                else:
+                    ema_state_dict[key] = model_value.detach().clone()
+            else:
+                ema_state_dict[key] = copy.deepcopy(model_value)
+
+
 @dataclass
 class TrainingConfig:
     """Hyperparameters and file paths for training."""
@@ -93,9 +124,16 @@ class TrainingConfig:
     tangent_fd_scale: float = 1.0e-6
     projection_mode: str = "exact"
     projection_tau: float = 0.05
+    ema_decay: float = 0.0
+    ema_eval: bool = False
+    ema_start_epoch: int = 1
     projected_student_hard_loss_multiplier: float = 1.0
     projected_student_any_boundary_loss_multiplier: float = 1.0
     projected_student_high_disp_loss_multiplier: float = 1.0
+    projected_student_teacher_gap_q90_loss_multiplier: float = 1.0
+    projected_student_teacher_gap_q95_loss_multiplier: float = 1.0
+    projected_student_delta_gap_q90_loss_multiplier: float = 1.0
+    projected_student_edge_apex_loss_multiplier: float = 1.0
     projected_student_candidate_loss_weights: dict[int, float] | None = None
     projected_student_branch_loss_weights: dict[int, float] | None = None
     projected_student_teacher_alignment_focus_multiplier: float = 1.0
@@ -586,6 +624,10 @@ def _load_split_for_training(
         "ds_valid_mask",
         "sampling_weight",
         "any_boundary_mask",
+        "teacher_gap_q90_mask",
+        "teacher_gap_q95_mask",
+        "delta_gap_q90_mask",
+        "edge_apex_adjacent_mask",
         "near_yield_mask",
         "near_smooth_left_mask",
         "near_smooth_right_mask",
@@ -688,6 +730,26 @@ def _load_split_for_training(
         )
     else:
         any_boundary_mask = any_boundary_mask.astype(bool)
+    teacher_gap_q90_mask = arrays.get("teacher_gap_q90_mask")
+    if teacher_gap_q90_mask is None:
+        teacher_gap_q90_mask = np.zeros(arrays["strain_eng"].shape[0], dtype=bool)
+    else:
+        teacher_gap_q90_mask = teacher_gap_q90_mask.astype(bool)
+    teacher_gap_q95_mask = arrays.get("teacher_gap_q95_mask")
+    if teacher_gap_q95_mask is None:
+        teacher_gap_q95_mask = np.zeros(arrays["strain_eng"].shape[0], dtype=bool)
+    else:
+        teacher_gap_q95_mask = teacher_gap_q95_mask.astype(bool)
+    delta_gap_q90_mask = arrays.get("delta_gap_q90_mask")
+    if delta_gap_q90_mask is None:
+        delta_gap_q90_mask = np.zeros(arrays["strain_eng"].shape[0], dtype=bool)
+    else:
+        delta_gap_q90_mask = delta_gap_q90_mask.astype(bool)
+    edge_apex_adjacent_mask = arrays.get("edge_apex_adjacent_mask")
+    if edge_apex_adjacent_mask is None:
+        edge_apex_adjacent_mask = np.zeros(arrays["strain_eng"].shape[0], dtype=bool)
+    else:
+        edge_apex_adjacent_mask = edge_apex_adjacent_mask.astype(bool)
     ds_valid_mask = arrays.get("ds_valid_mask")
     if ds_valid_mask is not None:
         ds_valid_mask = ds_valid_mask.astype(bool)
@@ -889,6 +951,10 @@ def _load_split_for_training(
         "near_left_apex_mask": near_left_apex_mask.astype(bool),
         "near_right_apex_mask": near_right_apex_mask.astype(bool),
         "any_boundary_mask": any_boundary_mask.astype(bool),
+        "teacher_gap_q90_mask": teacher_gap_q90_mask.astype(bool),
+        "teacher_gap_q95_mask": teacher_gap_q95_mask.astype(bool),
+        "delta_gap_q90_mask": delta_gap_q90_mask.astype(bool),
+        "edge_apex_adjacent_mask": edge_apex_adjacent_mask.astype(bool),
         "high_disp_mask": high_disp_mask.astype(bool),
         "hard_mask": (hard_mask.astype(bool) if hard_mask is not None else np.zeros(arrays["strain_eng"].shape[0], dtype=bool)),
         "plastic_mask": (
@@ -924,6 +990,10 @@ def _build_tensor_dataset(
     teacher_projection_delta_principal = torch.from_numpy(split_arrays["teacher_projection_delta_principal"])
     hard_mask = torch.from_numpy(split_arrays["hard_mask"].astype(np.int8))
     any_boundary_mask = torch.from_numpy(split_arrays["any_boundary_mask"].astype(np.int8))
+    teacher_gap_q90_mask = torch.from_numpy(split_arrays["teacher_gap_q90_mask"].astype(np.int8))
+    teacher_gap_q95_mask = torch.from_numpy(split_arrays["teacher_gap_q95_mask"].astype(np.int8))
+    delta_gap_q90_mask = torch.from_numpy(split_arrays["delta_gap_q90_mask"].astype(np.int8))
+    edge_apex_adjacent_mask = torch.from_numpy(split_arrays["edge_apex_adjacent_mask"].astype(np.int8))
     high_disp_mask = torch.from_numpy(split_arrays["high_disp_mask"].astype(np.int8))
     teacher_projection_candidate_id = torch.from_numpy(split_arrays["teacher_projection_candidate_id"])
     tangent_true = split_arrays.get("tangent_true")
@@ -951,6 +1021,10 @@ def _build_tensor_dataset(
         teacher_projection_delta_principal,
         hard_mask,
         any_boundary_mask,
+        teacher_gap_q90_mask,
+        teacher_gap_q95_mask,
+        delta_gap_q90_mask,
+        edge_apex_adjacent_mask,
         high_disp_mask,
         teacher_projection_candidate_id,
         tangent,
@@ -1018,12 +1092,20 @@ def _projected_student_row_weights(
     *,
     hard_mask: torch.Tensor,
     any_boundary_mask: torch.Tensor,
+    teacher_gap_q90_mask: torch.Tensor,
+    teacher_gap_q95_mask: torch.Tensor,
+    delta_gap_q90_mask: torch.Tensor,
+    edge_apex_adjacent_mask: torch.Tensor,
     high_disp_mask: torch.Tensor,
     teacher_projection_candidate_id: torch.Tensor,
     branch_true: torch.Tensor,
     hard_loss_multiplier: float,
     any_boundary_loss_multiplier: float,
     high_disp_loss_multiplier: float,
+    teacher_gap_q90_loss_multiplier: float,
+    teacher_gap_q95_loss_multiplier: float,
+    delta_gap_q90_loss_multiplier: float,
+    edge_apex_loss_multiplier: float,
     candidate_loss_weights: Mapping[int, float] | None,
     branch_loss_weights: Mapping[int, float] | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1038,6 +1120,26 @@ def _projected_student_row_weights(
         boundary_local = any_boundary_mask > 0
         weights = weights * torch.where(boundary_local, weights.new_tensor(float(any_boundary_loss_multiplier)), weights.new_tensor(1.0))
         focus_mask |= boundary_local
+    if teacher_gap_q90_loss_multiplier != 1.0:
+        teacher_gap_local = teacher_gap_q90_mask > 0
+        weights = weights * torch.where(teacher_gap_local, weights.new_tensor(float(teacher_gap_q90_loss_multiplier)), weights.new_tensor(1.0))
+        focus_mask |= teacher_gap_local
+    if teacher_gap_q95_loss_multiplier != 1.0:
+        teacher_gap_extreme_local = teacher_gap_q95_mask > 0
+        weights = weights * torch.where(
+            teacher_gap_extreme_local,
+            weights.new_tensor(float(teacher_gap_q95_loss_multiplier)),
+            weights.new_tensor(1.0),
+        )
+        focus_mask |= teacher_gap_extreme_local
+    if delta_gap_q90_loss_multiplier != 1.0:
+        delta_gap_local = delta_gap_q90_mask > 0
+        weights = weights * torch.where(delta_gap_local, weights.new_tensor(float(delta_gap_q90_loss_multiplier)), weights.new_tensor(1.0))
+        focus_mask |= delta_gap_local
+    if edge_apex_loss_multiplier != 1.0:
+        edge_apex_local = edge_apex_adjacent_mask > 0
+        weights = weights * torch.where(edge_apex_local, weights.new_tensor(float(edge_apex_loss_multiplier)), weights.new_tensor(1.0))
+        focus_mask |= edge_apex_local
     if high_disp_loss_multiplier != 1.0:
         high_disp_local = high_disp_mask > 0
         weights = weights * torch.where(high_disp_local, weights.new_tensor(float(high_disp_loss_multiplier)), weights.new_tensor(1.0))
@@ -1449,6 +1551,10 @@ def _regression_loss(
     teacher_projection_delta_principal: torch.Tensor,
     hard_mask: torch.Tensor,
     any_boundary_mask: torch.Tensor,
+    teacher_gap_q90_mask: torch.Tensor,
+    teacher_gap_q95_mask: torch.Tensor,
+    delta_gap_q90_mask: torch.Tensor,
+    edge_apex_adjacent_mask: torch.Tensor,
     high_disp_mask: torch.Tensor,
     teacher_projection_candidate_id: torch.Tensor,
     branch_logits: torch.Tensor | None,
@@ -1460,6 +1566,10 @@ def _regression_loss(
     projected_student_hard_loss_multiplier: float = 1.0,
     projected_student_any_boundary_loss_multiplier: float = 1.0,
     projected_student_high_disp_loss_multiplier: float = 1.0,
+    projected_student_teacher_gap_q90_loss_multiplier: float = 1.0,
+    projected_student_teacher_gap_q95_loss_multiplier: float = 1.0,
+    projected_student_delta_gap_q90_loss_multiplier: float = 1.0,
+    projected_student_edge_apex_loss_multiplier: float = 1.0,
     projected_student_candidate_loss_weights: Mapping[int, float] | None = None,
     projected_student_branch_loss_weights: Mapping[int, float] | None = None,
     projected_student_teacher_alignment_focus_multiplier: float = 1.0,
@@ -1493,6 +1603,10 @@ def _regression_loss(
             c_bar_sel = material_reduced[valid, 0]
             hard_sel = hard_mask[valid]
             any_boundary_sel = any_boundary_mask[valid]
+            teacher_gap_q90_sel = teacher_gap_q90_mask[valid]
+            teacher_gap_q95_sel = teacher_gap_q95_mask[valid]
+            delta_gap_q90_sel = delta_gap_q90_mask[valid]
+            edge_apex_sel = edge_apex_adjacent_mask[valid]
             high_disp_sel = high_disp_mask[valid]
             candidate_sel = teacher_projection_candidate_id[valid]
             branch_logits_sel = branch_logits[valid] if branch_logits is not None else None
@@ -1510,6 +1624,10 @@ def _regression_loss(
             c_bar_sel = material_reduced[:1, 0]
             hard_sel = hard_mask[:1]
             any_boundary_sel = any_boundary_mask[:1]
+            teacher_gap_q90_sel = teacher_gap_q90_mask[:1]
+            teacher_gap_q95_sel = teacher_gap_q95_mask[:1]
+            delta_gap_q90_sel = delta_gap_q90_mask[:1]
+            edge_apex_sel = edge_apex_adjacent_mask[:1]
             high_disp_sel = high_disp_mask[:1]
             candidate_sel = teacher_projection_candidate_id[:1]
             branch_logits_sel = branch_logits[:1] if branch_logits is not None else None
@@ -1538,12 +1656,20 @@ def _regression_loss(
         row_weights, focus_mask = _projected_student_row_weights(
             hard_mask=hard_sel,
             any_boundary_mask=any_boundary_sel,
+            teacher_gap_q90_mask=teacher_gap_q90_sel,
+            teacher_gap_q95_mask=teacher_gap_q95_sel,
+            delta_gap_q90_mask=delta_gap_q90_sel,
+            edge_apex_adjacent_mask=edge_apex_sel,
             high_disp_mask=high_disp_sel,
             teacher_projection_candidate_id=candidate_sel,
             branch_true=branch_true_sel,
             hard_loss_multiplier=projected_student_hard_loss_multiplier,
             any_boundary_loss_multiplier=projected_student_any_boundary_loss_multiplier,
             high_disp_loss_multiplier=projected_student_high_disp_loss_multiplier,
+            teacher_gap_q90_loss_multiplier=projected_student_teacher_gap_q90_loss_multiplier,
+            teacher_gap_q95_loss_multiplier=projected_student_teacher_gap_q95_loss_multiplier,
+            delta_gap_q90_loss_multiplier=projected_student_delta_gap_q90_loss_multiplier,
+            edge_apex_loss_multiplier=projected_student_edge_apex_loss_multiplier,
             candidate_loss_weights=projected_student_candidate_loss_weights,
             branch_loss_weights=projected_student_branch_loss_weights,
         )
@@ -2108,11 +2234,17 @@ def _epoch_loop(
     projected_student_hard_loss_multiplier: float = 1.0,
     projected_student_any_boundary_loss_multiplier: float = 1.0,
     projected_student_high_disp_loss_multiplier: float = 1.0,
+    projected_student_teacher_gap_q90_loss_multiplier: float = 1.0,
+    projected_student_teacher_gap_q95_loss_multiplier: float = 1.0,
+    projected_student_delta_gap_q90_loss_multiplier: float = 1.0,
+    projected_student_edge_apex_loss_multiplier: float = 1.0,
     projected_student_candidate_loss_weights: Mapping[int, float] | None = None,
     projected_student_branch_loss_weights: Mapping[int, float] | None = None,
     projected_student_teacher_alignment_focus_multiplier: float = 1.0,
     projected_student_hard_quantile: float = 0.0,
     projected_student_hard_quantile_weight: float = 0.0,
+    ema_state_dict: dict[str, torch.Tensor] | None = None,
+    ema_decay: float = 0.0,
     feature_stats: dict[str, Any] | None = None,
     coordinate_scales: dict[str, float] | None = None,
     symmetry_loss_weight: float = 0.05,
@@ -2132,7 +2264,7 @@ def _epoch_loop(
     n_branch_samples = 0
     n_samples = 0
 
-    for xb, yb, branch, stress_true, stress_principal_true, eigvecs, trial_stress, trial_principal, abr_true_raw, abr_true_nonneg, grho_true, soft_atlas_route_target, strain_eng, material_reduced, teacher_provisional_stress_principal, teacher_projected_stress_principal, teacher_projection_delta_principal, hard_mask, any_boundary_mask, high_disp_mask, teacher_projection_candidate_id, tangent_true in loader:
+    for xb, yb, branch, stress_true, stress_principal_true, eigvecs, trial_stress, trial_principal, abr_true_raw, abr_true_nonneg, grho_true, soft_atlas_route_target, strain_eng, material_reduced, teacher_provisional_stress_principal, teacher_projected_stress_principal, teacher_projection_delta_principal, hard_mask, any_boundary_mask, teacher_gap_q90_mask, teacher_gap_q95_mask, delta_gap_q90_mask, edge_apex_adjacent_mask, high_disp_mask, teacher_projection_candidate_id, tangent_true in loader:
         xb = xb.to(device)
         yb = yb.to(device)
         branch = branch.to(device)
@@ -2152,6 +2284,10 @@ def _epoch_loop(
         teacher_projection_delta_principal = teacher_projection_delta_principal.to(device)
         hard_mask = hard_mask.to(device)
         any_boundary_mask = any_boundary_mask.to(device)
+        teacher_gap_q90_mask = teacher_gap_q90_mask.to(device)
+        teacher_gap_q95_mask = teacher_gap_q95_mask.to(device)
+        delta_gap_q90_mask = delta_gap_q90_mask.to(device)
+        edge_apex_adjacent_mask = edge_apex_adjacent_mask.to(device)
         high_disp_mask = high_disp_mask.to(device)
         teacher_projection_candidate_id = teacher_projection_candidate_id.to(device)
         tangent_true = tangent_true.to(device)
@@ -2183,6 +2319,10 @@ def _epoch_loop(
             teacher_projection_delta_principal=teacher_projection_delta_principal,
             hard_mask=hard_mask,
             any_boundary_mask=any_boundary_mask,
+            teacher_gap_q90_mask=teacher_gap_q90_mask,
+            teacher_gap_q95_mask=teacher_gap_q95_mask,
+            delta_gap_q90_mask=delta_gap_q90_mask,
+            edge_apex_adjacent_mask=edge_apex_adjacent_mask,
             high_disp_mask=high_disp_mask,
             teacher_projection_candidate_id=teacher_projection_candidate_id,
             coordinate_scales=coordinate_scales,
@@ -2195,6 +2335,10 @@ def _epoch_loop(
             projected_student_hard_loss_multiplier=projected_student_hard_loss_multiplier,
             projected_student_any_boundary_loss_multiplier=projected_student_any_boundary_loss_multiplier,
             projected_student_high_disp_loss_multiplier=projected_student_high_disp_loss_multiplier,
+            projected_student_teacher_gap_q90_loss_multiplier=projected_student_teacher_gap_q90_loss_multiplier,
+            projected_student_teacher_gap_q95_loss_multiplier=projected_student_teacher_gap_q95_loss_multiplier,
+            projected_student_delta_gap_q90_loss_multiplier=projected_student_delta_gap_q90_loss_multiplier,
+            projected_student_edge_apex_loss_multiplier=projected_student_edge_apex_loss_multiplier,
             projected_student_candidate_loss_weights=projected_student_candidate_loss_weights,
             projected_student_branch_loss_weights=projected_student_branch_loss_weights,
             projected_student_teacher_alignment_focus_multiplier=projected_student_teacher_alignment_focus_multiplier,
@@ -2262,6 +2406,8 @@ def _epoch_loop(
             if grad_clip > 0.0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
+            if ema_state_dict is not None and ema_decay > 0.0:
+                _update_ema_state_dict(ema_state_dict, model, ema_decay)
 
         batch_size = xb.shape[0]
         total_loss += float(loss.detach().cpu()) * batch_size
@@ -2527,6 +2673,12 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
     if config.init_checkpoint:
         init_ckpt = torch.load(config.init_checkpoint, map_location=device)
         model.load_state_dict(init_ckpt["model_state_dict"])
+    if config.ema_decay < 0.0 or config.ema_decay >= 1.0:
+        raise ValueError(f"ema_decay must satisfy 0 <= decay < 1, got {config.ema_decay!r}.")
+    ema_enabled = config.ema_decay > 0.0
+    if config.ema_eval and not ema_enabled:
+        raise ValueError("ema_eval requires ema_decay > 0.")
+    ema_state_dict = _clone_state_dict(model.state_dict()) if ema_enabled else None
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     scheduler, scheduler_step_mode = _build_scheduler(optimizer, config)
@@ -2591,6 +2743,8 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
             if _branch_head_is_plastic_only(config.model_kind)
             else "full"
         ),
+        "ema_decay": config.ema_decay,
+        "ema_enabled": ema_enabled,
         "elastic_handling": "exact_upstream" if (_branch_head_is_plastic_only(config.model_kind) or _is_surface_model(config.model_kind)) else "model_decoded",
         "soft_atlas_route_temperature": (1.0 if _is_soft_atlas_surface_model(config.model_kind) else None),
         "soft_atlas_loss_weights": (
@@ -2637,12 +2791,21 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
             projected_student_hard_loss_multiplier=config.projected_student_hard_loss_multiplier,
             projected_student_any_boundary_loss_multiplier=config.projected_student_any_boundary_loss_multiplier,
             projected_student_high_disp_loss_multiplier=config.projected_student_high_disp_loss_multiplier,
+            projected_student_teacher_gap_q90_loss_multiplier=config.projected_student_teacher_gap_q90_loss_multiplier,
+            projected_student_teacher_gap_q95_loss_multiplier=config.projected_student_teacher_gap_q95_loss_multiplier,
+            projected_student_delta_gap_q90_loss_multiplier=config.projected_student_delta_gap_q90_loss_multiplier,
+            projected_student_edge_apex_loss_multiplier=config.projected_student_edge_apex_loss_multiplier,
             projected_student_candidate_loss_weights=config.projected_student_candidate_loss_weights,
             projected_student_branch_loss_weights=config.projected_student_branch_loss_weights,
             projected_student_teacher_alignment_focus_multiplier=config.projected_student_teacher_alignment_focus_multiplier,
             projected_student_hard_quantile=config.projected_student_hard_quantile,
             projected_student_hard_quantile_weight=config.projected_student_hard_quantile_weight,
+            ema_state_dict=(ema_state_dict if ema_enabled and epoch >= max(1, config.ema_start_epoch) else None),
+            ema_decay=config.ema_decay,
         )
+        raw_state_dict = _clone_state_dict(model.state_dict())
+        if config.ema_eval and ema_enabled and ema_state_dict is not None and epoch >= max(1, config.ema_start_epoch):
+            model.load_state_dict(ema_state_dict)
         val_metrics = _epoch_loop(
             model=model,
             loader=val_loader,
@@ -2667,12 +2830,18 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
             projected_student_hard_loss_multiplier=config.projected_student_hard_loss_multiplier,
             projected_student_any_boundary_loss_multiplier=config.projected_student_any_boundary_loss_multiplier,
             projected_student_high_disp_loss_multiplier=config.projected_student_high_disp_loss_multiplier,
+            projected_student_teacher_gap_q90_loss_multiplier=config.projected_student_teacher_gap_q90_loss_multiplier,
+            projected_student_teacher_gap_q95_loss_multiplier=config.projected_student_teacher_gap_q95_loss_multiplier,
+            projected_student_delta_gap_q90_loss_multiplier=config.projected_student_delta_gap_q90_loss_multiplier,
+            projected_student_edge_apex_loss_multiplier=config.projected_student_edge_apex_loss_multiplier,
             projected_student_candidate_loss_weights=config.projected_student_candidate_loss_weights,
             projected_student_branch_loss_weights=config.projected_student_branch_loss_weights,
             projected_student_teacher_alignment_focus_multiplier=config.projected_student_teacher_alignment_focus_multiplier,
             projected_student_hard_quantile=config.projected_student_hard_quantile,
             projected_student_hard_quantile_weight=config.projected_student_hard_quantile_weight,
         )
+        if config.ema_eval and ema_enabled:
+            model.load_state_dict(raw_state_dict)
 
         if scheduler is not None:
             if scheduler_step_mode == "val":
@@ -2691,8 +2860,13 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
         )
         completed_epochs = epoch
 
+        checkpoint_state = _clone_state_dict(
+            ema_state_dict
+            if config.ema_eval and ema_enabled and ema_state_dict is not None and epoch >= max(1, config.ema_start_epoch)
+            else model.state_dict()
+        )
         checkpoint = {
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": checkpoint_state,
             "metadata": metadata,
         }
         torch.save(checkpoint, last_checkpoint_path)
@@ -2739,7 +2913,7 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
         )
 
         for lbfgs_epoch in range(1, config.lbfgs_epochs + 1):
-            xb, yb, branch, stress_true, stress_principal_true, eigvecs, trial_stress, trial_principal, abr_true_raw, abr_true_nonneg, grho_true, soft_atlas_route_target, strain_eng, material_reduced, teacher_provisional_stress_principal, teacher_projected_stress_principal, teacher_projection_delta_principal, hard_mask, any_boundary_mask, high_disp_mask, teacher_projection_candidate_id, tangent_true = train_full
+            xb, yb, branch, stress_true, stress_principal_true, eigvecs, trial_stress, trial_principal, abr_true_raw, abr_true_nonneg, grho_true, soft_atlas_route_target, strain_eng, material_reduced, teacher_provisional_stress_principal, teacher_projected_stress_principal, teacher_projection_delta_principal, hard_mask, any_boundary_mask, teacher_gap_q90_mask, teacher_gap_q95_mask, delta_gap_q90_mask, edge_apex_adjacent_mask, high_disp_mask, teacher_projection_candidate_id, tangent_true = train_full
 
             def closure() -> torch.Tensor:
                 lbfgs.zero_grad(set_to_none=True)
@@ -2767,6 +2941,10 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
                     teacher_projection_delta_principal=teacher_projection_delta_principal,
                     hard_mask=hard_mask,
                     any_boundary_mask=any_boundary_mask,
+                    teacher_gap_q90_mask=teacher_gap_q90_mask,
+                    teacher_gap_q95_mask=teacher_gap_q95_mask,
+                    delta_gap_q90_mask=delta_gap_q90_mask,
+                    edge_apex_adjacent_mask=edge_apex_adjacent_mask,
                     high_disp_mask=high_disp_mask,
                     teacher_projection_candidate_id=teacher_projection_candidate_id,
                     coordinate_scales=coordinate_scales,
@@ -2779,6 +2957,10 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
                     projected_student_hard_loss_multiplier=config.projected_student_hard_loss_multiplier,
                     projected_student_any_boundary_loss_multiplier=config.projected_student_any_boundary_loss_multiplier,
                     projected_student_high_disp_loss_multiplier=config.projected_student_high_disp_loss_multiplier,
+                    projected_student_teacher_gap_q90_loss_multiplier=config.projected_student_teacher_gap_q90_loss_multiplier,
+                    projected_student_teacher_gap_q95_loss_multiplier=config.projected_student_teacher_gap_q95_loss_multiplier,
+                    projected_student_delta_gap_q90_loss_multiplier=config.projected_student_delta_gap_q90_loss_multiplier,
+                    projected_student_edge_apex_loss_multiplier=config.projected_student_edge_apex_loss_multiplier,
                     projected_student_candidate_loss_weights=config.projected_student_candidate_loss_weights,
                     projected_student_branch_loss_weights=config.projected_student_branch_loss_weights,
                     projected_student_teacher_alignment_focus_multiplier=config.projected_student_teacher_alignment_focus_multiplier,
@@ -2817,6 +2999,8 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
 
             model.train(True)
             lbfgs.step(closure)
+            if ema_enabled and ema_state_dict is not None:
+                _update_ema_state_dict(ema_state_dict, model, config.ema_decay)
 
             train_metrics = _epoch_loop(
                 model=model,
@@ -2842,12 +3026,21 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
                 projected_student_hard_loss_multiplier=config.projected_student_hard_loss_multiplier,
                 projected_student_any_boundary_loss_multiplier=config.projected_student_any_boundary_loss_multiplier,
                 projected_student_high_disp_loss_multiplier=config.projected_student_high_disp_loss_multiplier,
+                projected_student_teacher_gap_q90_loss_multiplier=config.projected_student_teacher_gap_q90_loss_multiplier,
+                projected_student_teacher_gap_q95_loss_multiplier=config.projected_student_teacher_gap_q95_loss_multiplier,
+                projected_student_delta_gap_q90_loss_multiplier=config.projected_student_delta_gap_q90_loss_multiplier,
+                projected_student_edge_apex_loss_multiplier=config.projected_student_edge_apex_loss_multiplier,
                 projected_student_candidate_loss_weights=config.projected_student_candidate_loss_weights,
                 projected_student_branch_loss_weights=config.projected_student_branch_loss_weights,
                 projected_student_teacher_alignment_focus_multiplier=config.projected_student_teacher_alignment_focus_multiplier,
                 projected_student_hard_quantile=config.projected_student_hard_quantile,
                 projected_student_hard_quantile_weight=config.projected_student_hard_quantile_weight,
+                ema_state_dict=ema_state_dict,
+                ema_decay=config.ema_decay,
             )
+            raw_state_dict = _clone_state_dict(model.state_dict())
+            if config.ema_eval and ema_enabled and ema_state_dict is not None:
+                model.load_state_dict(ema_state_dict)
             val_metrics = _epoch_loop(
                 model=model,
                 loader=val_loader,
@@ -2872,12 +3065,20 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
                 projected_student_hard_loss_multiplier=config.projected_student_hard_loss_multiplier,
                 projected_student_any_boundary_loss_multiplier=config.projected_student_any_boundary_loss_multiplier,
                 projected_student_high_disp_loss_multiplier=config.projected_student_high_disp_loss_multiplier,
+                projected_student_teacher_gap_q90_loss_multiplier=config.projected_student_teacher_gap_q90_loss_multiplier,
+                projected_student_teacher_gap_q95_loss_multiplier=config.projected_student_teacher_gap_q95_loss_multiplier,
+                projected_student_delta_gap_q90_loss_multiplier=config.projected_student_delta_gap_q90_loss_multiplier,
+                projected_student_edge_apex_loss_multiplier=config.projected_student_edge_apex_loss_multiplier,
                 projected_student_candidate_loss_weights=config.projected_student_candidate_loss_weights,
                 projected_student_branch_loss_weights=config.projected_student_branch_loss_weights,
                 projected_student_teacher_alignment_focus_multiplier=config.projected_student_teacher_alignment_focus_multiplier,
                 projected_student_hard_quantile=config.projected_student_hard_quantile,
                 projected_student_hard_quantile_weight=config.projected_student_hard_quantile_weight,
+                ema_state_dict=ema_state_dict,
+                ema_decay=config.ema_decay,
             )
+            if config.ema_eval and ema_enabled:
+                model.load_state_dict(raw_state_dict)
             epoch = completed_epochs + lbfgs_epoch
             current_lr = lbfgs.param_groups[0]["lr"]
             _write_history_row(
@@ -2889,8 +3090,11 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
                 lbfgs_phase=1,
             )
 
+            checkpoint_state = _clone_state_dict(
+                ema_state_dict if config.ema_eval and ema_enabled and ema_state_dict is not None else model.state_dict()
+            )
             checkpoint = {
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": checkpoint_state,
                 "metadata": metadata,
             }
             torch.save(checkpoint, last_checkpoint_path)
@@ -2926,6 +3130,8 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
         "best_checkpoint": str(best_checkpoint_path),
         "history_csv": str(history_path),
         "device": str(device),
+        "ema_decay": config.ema_decay,
+        "ema_enabled": ema_enabled,
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
